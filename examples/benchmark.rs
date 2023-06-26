@@ -2,16 +2,14 @@
 
 mod utils;
 
-use log::debug;
 use std::cmp;
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use smoltcp::iface::{InterfaceBuilder, NeighborCache, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{wait as phy_wait, Device, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
@@ -47,7 +45,7 @@ fn client(kind: Client) {
                 // print!("(P:{})", result);
                 processed += result
             }
-            Err(err) => panic!("cannot process: {}", err),
+            Err(err) => panic!("cannot process: {err}"),
         }
     }
 
@@ -82,8 +80,6 @@ fn main() {
         _ => panic!("invalid mode"),
     };
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
-
     let tcp1_rx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
     let tcp1_tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
     let tcp1_socket = tcp::Socket::new(tcp1_rx_buffer, tcp1_tx_buffer);
@@ -92,16 +88,21 @@ fn main() {
     let tcp2_tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
     let tcp2_socket = tcp::Socket::new(tcp2_rx_buffer, tcp2_tx_buffer);
 
-    let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24)];
-    let medium = device.capabilities().medium;
-    let mut builder = InterfaceBuilder::new().ip_addrs(ip_addrs);
-    if medium == Medium::Ethernet {
-        builder = builder
-            .hardware_addr(ethernet_addr.into())
-            .neighbor_cache(neighbor_cache);
-    }
-    let mut iface = builder.finalize(&mut device);
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
+    config.random_seed = rand::random();
+
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
+            .unwrap();
+    });
 
     let mut sockets = SocketSet::new(vec![]);
     let tcp1_handle = sockets.add(tcp1_socket);
@@ -112,12 +113,7 @@ fn main() {
     let mut processed = 0;
     while !CLIENT_DONE.load(Ordering::SeqCst) {
         let timestamp = Instant::now();
-        match iface.poll(timestamp, &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         // tcp:1234: emit data
         let socket = sockets.get_mut::<tcp::Socket>(tcp1_handle);

@@ -76,14 +76,14 @@ mod field {
 const CLASS_IN: u16 = 1;
 
 /// A read/write wrapper around a DNS packet buffer.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with DNS packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -262,7 +262,7 @@ fn parse_name_part<'a>(
     mut f: impl FnMut(&'a [u8]),
 ) -> Result<(&'a [u8], Option<usize>)> {
     loop {
-        let x = *bytes.get(0).ok_or(Error)?;
+        let x = *bytes.first().ok_or(Error)?;
         bytes = &bytes[1..];
         match x {
             0x00 => return Ok((bytes, None)),
@@ -273,7 +273,7 @@ fn parse_name_part<'a>(
                 f(label);
             }
             x if x & 0xC0 == 0xC0 => {
-                let y = *bytes.get(0).ok_or(Error)?;
+                let y = *bytes.first().ok_or(Error)?;
                 bytes = &bytes[1..];
 
                 let ptr = ((x & 0x3F) as usize) << 8 | (y as usize);
@@ -284,7 +284,7 @@ fn parse_name_part<'a>(
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Question<'a> {
     pub name: &'a [u8],
@@ -311,7 +311,7 @@ impl<'a> Question<'a> {
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         self.name.len() + 4
     }
 
@@ -324,7 +324,7 @@ impl<'a> Question<'a> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Record<'a> {
     pub name: &'a [u8],
@@ -355,7 +355,7 @@ impl<'a> RecordData<'a> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RecordData<'a> {
     #[cfg(feature = "proto-ipv4")]
@@ -401,7 +401,7 @@ impl<'a> Record<'a> {
 /// High-level DNS packet representation.
 ///
 /// Currently only supports query packets.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr<'a> {
     pub transaction_id: u16,
@@ -412,7 +412,7 @@ pub struct Repr<'a> {
 
 impl<'a> Repr<'a> {
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         field::HEADER_END + self.question.buffer_len()
     }
 

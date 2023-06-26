@@ -52,7 +52,7 @@ let repr = Ipv4Repr {
     dst_addr:    Ipv4Address::new(10, 0, 0, 2),
     next_header: IpProtocol::Tcp,
     payload_len: 10,
-    hop_limit:   64
+    hop_limit:   64,
 };
 let mut buffer = vec![0; repr.buffer_len() + repr.payload_len];
 { // emission
@@ -101,9 +101,9 @@ mod ipv4;
 #[cfg(feature = "proto-ipv6")]
 mod ipv6;
 #[cfg(feature = "proto-ipv6")]
-mod ipv6fragment;
+mod ipv6ext_header;
 #[cfg(feature = "proto-ipv6")]
-mod ipv6hopbyhop;
+mod ipv6fragment;
 #[cfg(feature = "proto-ipv6")]
 mod ipv6option;
 #[cfg(feature = "proto-ipv6")]
@@ -120,6 +120,8 @@ mod ndisc;
     any(feature = "medium-ethernet", feature = "medium-ieee802154")
 ))]
 mod ndiscoption;
+#[cfg(feature = "proto-rpl")]
+mod rpl;
 #[cfg(all(feature = "proto-sixlowpan", feature = "medium-ieee802154"))]
 mod sixlowpan;
 mod tcp;
@@ -142,6 +144,13 @@ pub use self::arp::{
     Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket, Repr as ArpRepr,
 };
 
+#[cfg(feature = "proto-rpl")]
+pub use self::rpl::{
+    data::HopByHopOption as RplHopByHopRepr, data::Packet as RplHopByHopPacket,
+    options::Packet as RplOptionPacket, options::Repr as RplOptionRepr,
+    InstanceId as RplInstanceId, Repr as RplRepr,
+};
+
 #[cfg(all(feature = "proto-sixlowpan", feature = "medium-ieee802154"))]
 pub use self::sixlowpan::{
     frag::{Key as SixlowpanFragKey, Packet as SixlowpanFragPacket, Repr as SixlowpanFragRepr},
@@ -151,7 +160,7 @@ pub use self::sixlowpan::{
         NhcPacket as SixlowpanNhcPacket, UdpNhcPacket as SixlowpanUdpNhcPacket,
         UdpNhcRepr as SixlowpanUdpNhcRepr,
     },
-    NextHeader as SixlowpanNextHeader, SixlowpanPacket,
+    AddressContext as SixlowpanAddressContext, NextHeader as SixlowpanNextHeader, SixlowpanPacket,
 };
 
 #[cfg(feature = "medium-ieee802154")]
@@ -181,18 +190,27 @@ pub use self::ipv6::{
 
 #[cfg(feature = "proto-ipv6")]
 pub use self::ipv6option::{
-    FailureType as Ipv6OptionFailureType, Ipv6Option, Repr as Ipv6OptionRepr,
+    FailureType as Ipv6OptionFailureType, Ipv6Option, Ipv6OptionsIterator, Repr as Ipv6OptionRepr,
     Type as Ipv6OptionType,
 };
 
 #[cfg(feature = "proto-ipv6")]
-pub use self::ipv6hopbyhop::{Header as Ipv6HopByHopHeader, Repr as Ipv6HopByHopRepr};
+pub use self::ipv6ext_header::{Header as Ipv6ExtHeader, Repr as Ipv6ExtHeaderRepr};
+
+#[cfg(feature = "proto-ipv6")]
+/// A read/write wrapper around an IPv6 Hop-By-Hop header.
+pub type Ipv6HopByHopHeader<T> = Ipv6ExtHeader<T>;
+#[cfg(feature = "proto-ipv6")]
+/// A high-level representation of an IPv6 Hop-By-Hop heade.
+pub type Ipv6HopByHopRepr<'a> = Ipv6ExtHeaderRepr<'a>;
 
 #[cfg(feature = "proto-ipv6")]
 pub use self::ipv6fragment::{Header as Ipv6FragmentHeader, Repr as Ipv6FragmentRepr};
 
 #[cfg(feature = "proto-ipv6")]
-pub use self::ipv6routing::{Header as Ipv6RoutingHeader, Repr as Ipv6RoutingRepr};
+pub use self::ipv6routing::{
+    Header as Ipv6RoutingHeader, Repr as Ipv6RoutingRepr, Type as Ipv6RoutingType,
+};
 
 #[cfg(feature = "proto-ipv4")]
 pub use self::icmpv4::{
@@ -243,9 +261,15 @@ pub use self::tcp::{
 
 #[cfg(feature = "proto-dhcpv4")]
 pub use self::dhcpv4::{
-    MessageType as DhcpMessageType, Packet as DhcpPacket, Repr as DhcpRepr,
-    CLIENT_PORT as DHCP_CLIENT_PORT, MAX_DNS_SERVER_COUNT as DHCP_MAX_DNS_SERVER_COUNT,
-    SERVER_PORT as DHCP_SERVER_PORT,
+    DhcpOption, DhcpOptionWriter, MessageType as DhcpMessageType, Packet as DhcpPacket,
+    Repr as DhcpRepr, CLIENT_PORT as DHCP_CLIENT_PORT,
+    MAX_DNS_SERVER_COUNT as DHCP_MAX_DNS_SERVER_COUNT, SERVER_PORT as DHCP_SERVER_PORT,
+};
+
+#[cfg(feature = "proto-dns")]
+pub use self::dns::{
+    Flags as DnsFlags, Opcode as DnsOpcode, Packet as DnsPacket, Rcode as DnsRcode,
+    Repr as DnsRepr, Type as DnsQueryType,
 };
 
 /// Parsing a packet failed.
@@ -267,20 +291,32 @@ impl fmt::Display for Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Representation of an hardware address, such as an Ethernet address or an IEEE802.15.4 address.
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "medium-ip",
+    feature = "medium-ethernet",
+    feature = "medium-ieee802154"
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum HardwareAddress {
+    #[cfg(feature = "medium-ip")]
+    Ip,
     #[cfg(feature = "medium-ethernet")]
     Ethernet(EthernetAddress),
     #[cfg(feature = "medium-ieee802154")]
     Ieee802154(Ieee802154Address),
 }
 
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "medium-ip",
+    feature = "medium-ethernet",
+    feature = "medium-ieee802154"
+))]
 impl HardwareAddress {
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => unreachable!(),
             #[cfg(feature = "medium-ethernet")]
             HardwareAddress::Ethernet(addr) => addr.as_bytes(),
             #[cfg(feature = "medium-ieee802154")]
@@ -291,6 +327,8 @@ impl HardwareAddress {
     /// Query wether the address is an unicast address.
     pub fn is_unicast(&self) -> bool {
         match self {
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => unreachable!(),
             #[cfg(feature = "medium-ethernet")]
             HardwareAddress::Ethernet(addr) => addr.is_unicast(),
             #[cfg(feature = "medium-ieee802154")]
@@ -301,22 +339,60 @@ impl HardwareAddress {
     /// Query wether the address is a broadcast address.
     pub fn is_broadcast(&self) -> bool {
         match self {
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => unreachable!(),
             #[cfg(feature = "medium-ethernet")]
             HardwareAddress::Ethernet(addr) => addr.is_broadcast(),
             #[cfg(feature = "medium-ieee802154")]
             HardwareAddress::Ieee802154(addr) => addr.is_broadcast(),
         }
     }
+
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn ethernet_or_panic(&self) -> EthernetAddress {
+        match self {
+            HardwareAddress::Ethernet(addr) => *addr,
+            #[allow(unreachable_patterns)]
+            _ => panic!("HardwareAddress is not Ethernet."),
+        }
+    }
+
+    #[cfg(feature = "medium-ieee802154")]
+    pub(crate) fn ieee802154_or_panic(&self) -> Ieee802154Address {
+        match self {
+            HardwareAddress::Ieee802154(addr) => *addr,
+            #[allow(unreachable_patterns)]
+            _ => panic!("HardwareAddress is not Ethernet."),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn medium(&self) -> Medium {
+        match self {
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => Medium::Ip,
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(_) => Medium::Ethernet,
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(_) => Medium::Ieee802154,
+        }
+    }
 }
 
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "medium-ip",
+    feature = "medium-ethernet",
+    feature = "medium-ieee802154"
+))]
 impl core::fmt::Display for HardwareAddress {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => write!(f, "no hardware addr"),
             #[cfg(feature = "medium-ethernet")]
-            HardwareAddress::Ethernet(addr) => write!(f, "{}", addr),
+            HardwareAddress::Ethernet(addr) => write!(f, "{addr}"),
             #[cfg(feature = "medium-ieee802154")]
-            HardwareAddress::Ieee802154(addr) => write!(f, "{}", addr),
+            HardwareAddress::Ieee802154(addr) => write!(f, "{addr}"),
         }
     }
 }
@@ -367,11 +443,11 @@ impl RawHardwareAddress {
         &self.data[..self.len as usize]
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len as usize
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -408,7 +484,7 @@ impl core::fmt::Display for RawHardwareAddress {
             if i != 0 {
                 write!(f, ":")?;
             }
-            write!(f, "{:02x}", b)?;
+            write!(f, "{b:02x}")?;
         }
         Ok(())
     }

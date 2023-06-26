@@ -7,8 +7,7 @@ use crate::wire::ip::checksum;
 use crate::wire::{IpAddress, IpProtocol};
 
 /// A read/write wrapper around an User Datagram Protocol packet buffer.
-#[derive(Debug, PartialEq, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
 }
@@ -23,7 +22,7 @@ mod field {
     pub const LENGTH: Field = 4..6;
     pub const CHECKSUM: Field = 6..8;
 
-    pub fn PAYLOAD(length: u16) -> Field {
+    pub const fn PAYLOAD(length: u16) -> Field {
         CHECKSUM.end..(length as usize)
     }
 }
@@ -33,7 +32,7 @@ pub const HEADER_LEN: usize = field::CHECKSUM.end;
 #[allow(clippy::len_without_is_empty)]
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with UDP packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -208,7 +207,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an User Datagram Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr {
     pub src_port: u16,
     pub dst_port: u16,
@@ -246,8 +244,23 @@ impl Repr {
     }
 
     /// Return the length of the packet header that will be emitted from this high-level representation.
-    pub fn header_len(&self) -> usize {
+    pub const fn header_len(&self) -> usize {
         HEADER_LEN
+    }
+
+    /// Emit a high-level representation into an User Datagram Protocol packet.
+    ///
+    /// This never calculates the checksum, and is intended for internal-use only,
+    /// not for packets that are going to be actually sent over the network. For
+    /// example, when decompressing 6lowpan.
+    pub(crate) fn emit_header<T: ?Sized>(&self, packet: &mut Packet<&mut T>, payload_len: usize)
+    where
+        T: AsRef<[u8]> + AsMut<[u8]>,
+    {
+        packet.set_src_port(self.src_port);
+        packet.set_dst_port(self.dst_port);
+        packet.set_len((HEADER_LEN + payload_len) as u16);
+        packet.set_checksum(0);
     }
 
     /// Emit a high-level representation into an User Datagram Protocol packet.
@@ -290,9 +303,30 @@ impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl<'a, T: AsRef<[u8]> + ?Sized> defmt::Format for Packet<&'a T> {
+    fn format(&self, fmt: defmt::Formatter) {
+        // Cannot use Repr::parse because we don't have the IP addresses.
+        defmt::write!(
+            fmt,
+            "UDP src={} dst={} len={}",
+            self.src_port(),
+            self.dst_port(),
+            self.payload().len()
+        );
+    }
+}
+
 impl fmt::Display for Repr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "UDP src={} dst={}", self.src_port, self.dst_port)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Repr {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "UDP src={} dst={}", self.src_port, self.dst_port);
     }
 }
 
@@ -305,8 +339,8 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         match Packet::new_checked(buffer) {
-            Err(err) => write!(f, "{}({})", indent, err),
-            Ok(packet) => write!(f, "{}{}", indent, packet),
+            Err(err) => write!(f, "{indent}({err})"),
+            Ok(packet) => write!(f, "{indent}{packet}"),
         }
     }
 }
@@ -358,7 +392,7 @@ mod test {
         packet.set_checksum(0xffff);
         packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
         packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 
     #[test]
@@ -429,7 +463,7 @@ mod test {
             |payload| payload.copy_from_slice(&PAYLOAD_BYTES),
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 
     #[test]

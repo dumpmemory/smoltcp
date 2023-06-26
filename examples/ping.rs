@@ -1,15 +1,13 @@
 mod utils;
 
 use byteorder::{ByteOrder, NetworkEndian};
-use log::debug;
-use smoltcp::iface::SocketSet;
+use smoltcp::iface::{Interface, SocketSet};
 use std::cmp;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 
-use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
+use smoltcp::iface::Config;
 use smoltcp::phy::wait as phy_wait;
 use smoltcp::phy::Device;
 use smoltcp::socket::icmp;
@@ -90,7 +88,7 @@ fn main() {
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
     let device_caps = device.capabilities();
-    let address = IpAddress::from_str(&matches.free[0]).expect("invalid address format");
+    let remote_addr = IpAddress::from_str(&matches.free[0]).expect("invalid address format");
     let count = matches
         .opt_str("count")
         .map(|s| usize::from_str(&s).unwrap())
@@ -106,37 +104,41 @@ fn main() {
             .unwrap_or(5),
     );
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
+    config.random_seed = rand::random();
 
-    let remote_addr = address;
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100))
+        .unwrap();
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100))
+        .unwrap();
 
+    // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-
-    let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
-    let src_ipv6 = IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1);
-    let ip_addrs = [
-        IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-        IpCidr::new(src_ipv6, 64),
-        IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
-    ];
-    let default_v4_gw = Ipv4Address::new(192, 168, 69, 100);
-    let default_v6_gw = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100);
-    let mut routes_storage = [None; 2];
-    let mut routes = Routes::new(&mut routes_storage[..]);
-    routes.add_default_ipv4_route(default_v4_gw).unwrap();
-    routes.add_default_ipv6_route(default_v6_gw).unwrap();
-
-    let medium = device.capabilities().medium;
-    let mut builder = InterfaceBuilder::new().ip_addrs(ip_addrs).routes(routes);
-    if medium == Medium::Ethernet {
-        builder = builder
-            .hardware_addr(ethernet_addr.into())
-            .neighbor_cache(neighbor_cache);
-    }
-    let mut iface = builder.finalize(&mut device);
-
     let mut sockets = SocketSet::new(vec![]);
     let icmp_handle = sockets.add(icmp_socket);
 
@@ -149,12 +151,7 @@ fn main() {
 
     loop {
         let timestamp = Instant::now();
-        match iface.poll(timestamp, &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         let timestamp = Instant::now();
         let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -190,7 +187,7 @@ fn main() {
                         remote_addr
                     );
                     icmp_repr.emit(
-                        &src_ipv6,
+                        &iface.ipv6_addr().unwrap().into_address(),
                         &remote_addr,
                         &mut icmp_packet,
                         &device_caps.checksum,
@@ -224,7 +221,7 @@ fn main() {
                     let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
                     let icmp_repr = Icmpv6Repr::parse(
                         &remote_addr,
-                        &src_ipv6,
+                        &iface.ipv6_addr().unwrap().into_address(),
                         &icmp_packet,
                         &device_caps.checksum,
                     )
@@ -246,7 +243,7 @@ fn main() {
             if timestamp - *from < timeout {
                 true
             } else {
-                println!("From {} icmp_seq={} timeout", remote_addr, seq);
+                println!("From {remote_addr} icmp_seq={seq} timeout");
                 false
             }
         });
@@ -268,7 +265,7 @@ fn main() {
         }
     }
 
-    println!("--- {} ping statistics ---", remote_addr);
+    println!("--- {remote_addr} ping statistics ---");
     println!(
         "{} packets transmitted, {} received, {:.0}% packet loss",
         seq_no,

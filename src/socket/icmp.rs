@@ -24,6 +24,18 @@ pub enum BindError {
     Unaddressable,
 }
 
+impl core::fmt::Display for BindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            BindError::InvalidState => write!(f, "invalid state"),
+            BindError::Unaddressable => write!(f, "unaddressable"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BindError {}
+
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -32,6 +44,18 @@ pub enum SendError {
     BufferFull,
 }
 
+impl core::fmt::Display for SendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            SendError::Unaddressable => write!(f, "unaddressable"),
+            SendError::BufferFull => write!(f, "buffer full"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SendError {}
+
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -39,13 +63,25 @@ pub enum RecvError {
     Exhausted,
 }
 
+impl core::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            RecvError::Exhausted => write!(f, "exhausted"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RecvError {}
+
 /// Type of endpoint to bind the ICMP socket to. See [IcmpSocket::bind] for
 /// more details.
 ///
 /// [IcmpSocket::bind]: struct.IcmpSocket.html#method.bind
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Endpoint {
+    #[default]
     Unspecified,
     Ident(u16),
     Udp(IpListenEndpoint),
@@ -58,12 +94,6 @@ impl Endpoint {
             Endpoint::Udp(endpoint) => endpoint.port != 0,
             Endpoint::Unspecified => false,
         }
-    }
-}
-
-impl Default for Endpoint {
-    fn default() -> Endpoint {
-        Endpoint::Unspecified
     }
 }
 
@@ -444,9 +474,9 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn process(&mut self, _cx: &mut Context, ip_repr: &IpRepr, icmp_repr: &IcmpRepr) {
-        match *icmp_repr {
+        match icmp_repr {
             #[cfg(feature = "proto-ipv4")]
-            IcmpRepr::Ipv4(ref icmp_repr) => {
+            IcmpRepr::Ipv4(icmp_repr) => {
                 net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
                 match self
@@ -463,7 +493,7 @@ impl<'a> Socket<'a> {
                 }
             }
             #[cfg(feature = "proto-ipv6")]
-            IcmpRepr::Ipv6(ref icmp_repr) => {
+            IcmpRepr::Ipv6(icmp_repr) => {
                 net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
                 match self
@@ -619,7 +649,6 @@ mod tests_common {
 mod test_ipv4 {
     use super::tests_common::*;
     use crate::wire::{Icmpv4DstUnreachable, IpEndpoint, Ipv4Address};
-    use crate::Error;
 
     const REMOTE_IPV4: Ipv4Address = Ipv4Address([192, 168, 1, 2]);
     const LOCAL_IPV4: Ipv4Address = Ipv4Address([192, 168, 1, 1]);
@@ -683,7 +712,7 @@ mod test_ipv4 {
         ECHOV4_REPR.emit(&mut packet, &checksum);
 
         assert_eq!(
-            socket.send_slice(&packet.into_inner()[..], REMOTE_IPV4.into()),
+            socket.send_slice(&*packet.into_inner(), REMOTE_IPV4.into()),
             Ok(())
         );
         assert_eq!(
@@ -696,9 +725,9 @@ mod test_ipv4 {
             socket.dispatch(&mut cx, |_, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV4_REPR);
                 assert_eq!(icmp_repr, ECHOV4_REPR.into());
-                Err(Error::Unaddressable)
+                Err(())
             }),
-            Err(Error::Unaddressable)
+            Err(())
         );
         // buffer is not taken off of the tx queue due to the error
         assert!(!socket.can_send());
@@ -707,7 +736,7 @@ mod test_ipv4 {
             socket.dispatch(&mut cx, |_, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV4_REPR);
                 assert_eq!(icmp_repr, ECHOV4_REPR.into());
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             }),
             Ok(())
         );
@@ -728,7 +757,7 @@ mod test_ipv4 {
         s.set_hop_limit(Some(0x2a));
 
         assert_eq!(
-            s.send_slice(&packet.into_inner()[..], REMOTE_IPV4.into()),
+            s.send_slice(&*packet.into_inner(), REMOTE_IPV4.into()),
             Ok(())
         );
         assert_eq!(
@@ -743,7 +772,7 @@ mod test_ipv4 {
                         hop_limit: 0x2a,
                     })
                 );
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             }),
             Ok(())
         );
@@ -761,9 +790,9 @@ mod test_ipv4 {
         let checksum = ChecksumCapabilities::default();
 
         let mut bytes = [0xff; 24];
-        let mut packet = Icmpv4Packet::new_unchecked(&mut bytes);
+        let mut packet = Icmpv4Packet::new_unchecked(&mut bytes[..]);
         ECHOV4_REPR.emit(&mut packet, &checksum);
-        let data = &packet.into_inner()[..];
+        let data = &*packet.into_inner();
 
         assert!(socket.accepts(&mut cx, &REMOTE_IPV4_REPR, &ECHOV4_REPR.into()));
         socket.process(&mut cx, &REMOTE_IPV4_REPR, &ECHOV4_REPR.into());
@@ -816,7 +845,7 @@ mod test_ipv4 {
             &checksum,
         );
 
-        let data = &packet.into_inner()[..];
+        let data = &*packet.into_inner();
 
         let icmp_repr = Icmpv4Repr::DstUnreachable {
             reason: Icmpv4DstUnreachable::PortUnreachable,
@@ -850,7 +879,7 @@ mod test_ipv4 {
         icmp_repr.emit(&mut packet, &checksum);
         assert_eq!(
             socket.recv(),
-            Ok((&packet.into_inner()[..], REMOTE_IPV4.into()))
+            Ok((&*packet.into_inner(), REMOTE_IPV4.into()))
         );
         assert!(!socket.can_recv());
     }
@@ -861,7 +890,6 @@ mod test_ipv6 {
     use super::tests_common::*;
 
     use crate::wire::{Icmpv6DstUnreachable, IpEndpoint, Ipv6Address};
-    use crate::Error;
 
     const REMOTE_IPV6: Ipv6Address =
         Ipv6Address([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
@@ -911,7 +939,7 @@ mod test_ipv6 {
 
         assert_eq!(
             socket.dispatch(&mut cx, |_, _| unreachable!()),
-            Ok::<_, Error>(())
+            Ok::<_, ()>(())
         );
 
         // This buffer is too long
@@ -931,7 +959,7 @@ mod test_ipv6 {
         );
 
         assert_eq!(
-            socket.send_slice(&packet.into_inner()[..], REMOTE_IPV6.into()),
+            socket.send_slice(&*packet.into_inner(), REMOTE_IPV6.into()),
             Ok(())
         );
         assert_eq!(
@@ -944,9 +972,9 @@ mod test_ipv6 {
             socket.dispatch(&mut cx, |_, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV6_REPR);
                 assert_eq!(icmp_repr, ECHOV6_REPR.into());
-                Err(Error::Unaddressable)
+                Err(())
             }),
-            Err(Error::Unaddressable)
+            Err(())
         );
         // buffer is not taken off of the tx queue due to the error
         assert!(!socket.can_send());
@@ -955,7 +983,7 @@ mod test_ipv6 {
             socket.dispatch(&mut cx, |_, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV6_REPR);
                 assert_eq!(icmp_repr, ECHOV6_REPR.into());
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             }),
             Ok(())
         );
@@ -981,7 +1009,7 @@ mod test_ipv6 {
         s.set_hop_limit(Some(0x2a));
 
         assert_eq!(
-            s.send_slice(&packet.into_inner()[..], REMOTE_IPV6.into()),
+            s.send_slice(&*packet.into_inner(), REMOTE_IPV6.into()),
             Ok(())
         );
         assert_eq!(
@@ -996,7 +1024,7 @@ mod test_ipv6 {
                         hop_limit: 0x2a,
                     })
                 );
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             }),
             Ok(())
         );
@@ -1014,14 +1042,14 @@ mod test_ipv6 {
         let checksum = ChecksumCapabilities::default();
 
         let mut bytes = [0xff; 24];
-        let mut packet = Icmpv6Packet::new_unchecked(&mut bytes);
+        let mut packet = Icmpv6Packet::new_unchecked(&mut bytes[..]);
         ECHOV6_REPR.emit(
             &LOCAL_IPV6.into(),
             &REMOTE_IPV6.into(),
             &mut packet,
             &checksum,
         );
-        let data = &packet.into_inner()[..];
+        let data = &*packet.into_inner();
 
         assert!(socket.accepts(&mut cx, &REMOTE_IPV6_REPR, &ECHOV6_REPR.into()));
         socket.process(&mut cx, &REMOTE_IPV6_REPR, &ECHOV6_REPR.into());
@@ -1079,7 +1107,7 @@ mod test_ipv6 {
             &checksum,
         );
 
-        let data = &packet.into_inner()[..];
+        let data = &*packet.into_inner();
 
         let icmp_repr = Icmpv6Repr::DstUnreachable {
             reason: Icmpv6DstUnreachable::PortUnreachable,
@@ -1118,7 +1146,7 @@ mod test_ipv6 {
         );
         assert_eq!(
             socket.recv(),
-            Ok((&packet.into_inner()[..], REMOTE_IPV6.into()))
+            Ok((&*packet.into_inner(), REMOTE_IPV6.into()))
         );
         assert!(!socket.can_recv());
     }

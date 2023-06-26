@@ -43,16 +43,15 @@
 mod utils;
 
 use log::debug;
-use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::str;
 
-use smoltcp::iface::{FragmentsCache, InterfaceBuilder, NeighborCache, SocketSet};
-use smoltcp::phy::{wait as phy_wait, Medium, RawSocket};
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::phy::{wait as phy_wait, Device, Medium, RawSocket};
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{Ieee802154Pan, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
 
 fn main() {
     utils::setup_logging("");
@@ -63,13 +62,34 @@ fn main() {
     let mut matches = utils::parse_options(&opts, free);
 
     let device = RawSocket::new("wpan1", Medium::Ieee802154).unwrap();
-
     let fd = device.as_raw_fd();
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => Config::new(
+            Ieee802154Address::Extended([0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]).into(),
+        ),
+    };
+    config.random_seed = rand::random();
+    config.pan_id = Some(Ieee802154Pan(0xbeef));
 
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(
+                IpAddress::v6(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
+                64,
+            ))
+            .unwrap();
+    });
+
+    // Create sockets
     let udp_rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1280]);
     let udp_tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1280]);
     let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
@@ -77,39 +97,6 @@ fn main() {
     let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
-
-    let ieee802154_addr = smoltcp::wire::Ieee802154Address::Extended([
-        0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    ]);
-    let ip_addrs = [IpCidr::new(
-        IpAddress::v6(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
-        64,
-    )];
-
-    let mut builder = InterfaceBuilder::new()
-        .ip_addrs(ip_addrs)
-        .pan_id(Ieee802154Pan(0xbeef));
-    builder = builder
-        .hardware_addr(ieee802154_addr.into())
-        .neighbor_cache(neighbor_cache);
-
-    #[cfg(feature = "proto-ipv4-fragmentation")]
-    {
-        let ipv4_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder.ipv4_fragments_cache(ipv4_frag_cache);
-    }
-
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    let mut out_packet_buffer = [0u8; 1280];
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    {
-        let sixlowpan_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder
-            .sixlowpan_fragments_cache(sixlowpan_frag_cache)
-            .sixlowpan_out_packet_cache(&mut out_packet_buffer[..]);
-    }
-
-    let mut iface = builder.finalize(&mut device);
 
     let mut sockets = SocketSet::new(vec![]);
     let udp_handle = sockets.add(udp_socket);
@@ -122,17 +109,7 @@ fn main() {
 
     loop {
         let timestamp = Instant::now();
-
-        let mut poll = true;
-        while poll {
-            match iface.poll(timestamp, &mut device, &mut sockets) {
-                Ok(r) => poll = r,
-                Err(e) => {
-                    debug!("poll error: {}", e);
-                    break;
-                }
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         // udp:6969: respond "hello"
         let socket = sockets.get_mut::<udp::Socket>(udp_handle);

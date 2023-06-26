@@ -9,8 +9,8 @@ mod utils;
 use core::str;
 use log::{debug, error, info};
 
-use smoltcp::iface::{InterfaceBuilder, NeighborCache, SocketSet};
-use smoltcp::phy::{Loopback, Medium};
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::phy::{Device, Loopback, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
@@ -82,16 +82,23 @@ fn main() {
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ true)
     };
 
-    let mut neighbor_cache_entries = [None; 8];
-    let mut neighbor_cache = NeighborCache::new(&mut neighbor_cache_entries[..]);
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
 
-    let mut ip_addrs = [IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)];
-    let mut iface = InterfaceBuilder::new()
-        .hardware_addr(EthernetAddress::default().into())
-        .neighbor_cache(neighbor_cache)
-        .ip_addrs(ip_addrs)
-        .finalize(&mut device);
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+            .unwrap();
+    });
 
+    // Create sockets
     let server_socket = {
         // It is not strictly necessary to use a `static mut` and unsafe code here, but
         // on embedded systems that smoltcp targets it is far better to allocate the data
@@ -121,12 +128,7 @@ fn main() {
     let mut did_connect = false;
     let mut done = false;
     while !done && clock.elapsed() < Instant::from_millis(10_000) {
-        match iface.poll(clock.elapsed(), &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(clock.elapsed(), &mut device, &mut sockets);
 
         let mut socket = sockets.get_mut::<tcp::Socket>(server_handle);
         if !socket.is_active() && !socket.is_listening() {

@@ -28,7 +28,7 @@ impl fmt::Display for FrameType {
             FrameType::Multipurpose => write!(f, "Multipurpose"),
             FrameType::FragmentOrFrak => write!(f, "FragmentOrFrak"),
             FrameType::Extended => write!(f, "Extended"),
-            FrameType::Unknown(id) => write!(f, "0b{:04b}", id),
+            FrameType::Unknown(id) => write!(f, "0b{id:04b}"),
         }
     }
 }
@@ -43,7 +43,7 @@ enum_with_unknown! {
 
 impl AddressingMode {
     /// Return the size in octets of the address.
-    fn size(&self) -> usize {
+    const fn size(&self) -> usize {
         match self {
             AddressingMode::Absent => 0,
             AddressingMode::Short => 2,
@@ -59,14 +59,13 @@ impl fmt::Display for AddressingMode {
             AddressingMode::Absent => write!(f, "Absent"),
             AddressingMode::Short => write!(f, "Short"),
             AddressingMode::Extended => write!(f, "Extended"),
-            AddressingMode::Unknown(id) => write!(f, "0b{:04b}", id),
+            AddressingMode::Unknown(id) => write!(f, "0b{id:04b}"),
         }
     }
 }
 
 /// A IEEE 802.15.4 PAN.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Pan(pub u16);
 
 impl Pan {
@@ -80,13 +79,54 @@ impl Pan {
     }
 }
 
+impl fmt::Display for Pan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:0x}", self.0)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Pan {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{:02x}", self.0)
+    }
+}
+
 /// A IEEE 802.15.4 address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Address {
     Absent,
     Short([u8; 2]),
     Extended([u8; 8]),
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Address {
+    fn format(&self, f: defmt::Formatter) {
+        match self {
+            Self::Absent => defmt::write!(f, "not-present"),
+            Self::Short(bytes) => defmt::write!(f, "{:02x}:{:02x}", bytes[0], bytes[1]),
+            Self::Extended(bytes) => defmt::write!(
+                f,
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7]
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for Address {
+    fn default() -> Self {
+        Address::Extended([0u8; 8])
+    }
 }
 
 impl Address {
@@ -103,11 +143,11 @@ impl Address {
         *self == Self::BROADCAST
     }
 
-    fn short_from_bytes(a: [u8; 2]) -> Self {
+    const fn short_from_bytes(a: [u8; 2]) -> Self {
         Self::Short(a)
     }
 
-    fn extended_from_bytes(a: [u8; 8]) -> Self {
+    const fn extended_from_bytes(a: [u8; 8]) -> Self {
         Self::Extended(a)
     }
 
@@ -125,7 +165,7 @@ impl Address {
         }
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         match self {
             Address::Absent => &[],
             Address::Short(value) => value,
@@ -164,10 +204,10 @@ impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Absent => write!(f, "not-present"),
-            Self::Short(bytes) => write!(f, "{:02x}-{:02x}", bytes[0], bytes[1]),
+            Self::Short(bytes) => write!(f, "{:02x}:{:02x}", bytes[0], bytes[1]),
             Self::Extended(bytes) => write!(
                 f,
-                "{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}",
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
             ),
         }
@@ -224,7 +264,7 @@ macro_rules! set_fc_bit_field {
 
 impl<T: AsRef<[u8]>> Frame<T> {
     /// Input a raw octet buffer with Ethernet frame structure.
-    pub fn new_unchecked(buffer: T) -> Frame<T> {
+    pub const fn new_unchecked(buffer: T) -> Frame<T> {
         Frame { buffer }
     }
 
@@ -630,21 +670,21 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Frame<T> {
 
     /// Set the destination address.
     #[inline]
-    pub fn set_dst_addr(&mut self, mut value: Address) {
+    pub fn set_dst_addr(&mut self, value: Address) {
         match value {
             Address::Absent => self.set_dst_addressing_mode(AddressingMode::Absent),
-            Address::Short(ref mut value) => {
+            Address::Short(mut value) => {
                 value.reverse();
                 self.set_dst_addressing_mode(AddressingMode::Short);
                 let data = self.buffer.as_mut();
-                data[field::ADDRESSING][2..2 + 2].copy_from_slice(value);
+                data[field::ADDRESSING][2..2 + 2].copy_from_slice(&value);
                 value.reverse();
             }
-            Address::Extended(ref mut value) => {
+            Address::Extended(mut value) => {
                 value.reverse();
                 self.set_dst_addressing_mode(AddressingMode::Extended);
                 let data = &mut self.buffer.as_mut()[field::ADDRESSING];
-                data[2..2 + 8].copy_from_slice(value);
+                data[2..2 + 8].copy_from_slice(&value);
                 value.reverse();
             }
         }
@@ -676,7 +716,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Frame<T> {
 
     /// Set the source address.
     #[inline]
-    pub fn set_src_addr(&mut self, mut value: Address) {
+    pub fn set_src_addr(&mut self, value: Address) {
         let offset = match self.dst_addressing_mode() {
             AddressingMode::Absent => 0,
             AddressingMode::Short => 2,
@@ -688,18 +728,18 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Frame<T> {
 
         match value {
             Address::Absent => self.set_src_addressing_mode(AddressingMode::Absent),
-            Address::Short(ref mut value) => {
+            Address::Short(mut value) => {
                 value.reverse();
                 self.set_src_addressing_mode(AddressingMode::Short);
                 let data = &mut self.buffer.as_mut()[field::ADDRESSING];
-                data[offset..offset + 2].copy_from_slice(value);
+                data[offset..offset + 2].copy_from_slice(&value);
                 value.reverse();
             }
-            Address::Extended(ref mut value) => {
+            Address::Extended(mut value) => {
                 value.reverse();
                 self.set_src_addressing_mode(AddressingMode::Extended);
                 let data = &mut self.buffer.as_mut()[field::ADDRESSING];
-                data[offset..offset + 8].copy_from_slice(value);
+                data[offset..offset + 8].copy_from_slice(&value);
                 value.reverse();
             }
         }
@@ -731,16 +771,56 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Frame<T> {
 
 impl<T: AsRef<[u8]>> fmt::Display for Frame<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "IEEE802.15.4 frame type={} seq={:2x?} dst_pan={:x?} dest={:x?} src_pan={:?} src={:x?}",
-            self.frame_type(),
-            self.sequence_number(),
-            self.dst_pan_id(),
-            self.dst_addr(),
-            self.src_pan_id(),
-            self.src_addr(),
-        )
+        write!(f, "IEEE802.15.4 frame type={}", self.frame_type())?;
+
+        if let Some(seq) = self.sequence_number() {
+            write!(f, " seq={:02x}", seq)?;
+        }
+
+        if let Some(pan) = self.dst_pan_id() {
+            write!(f, " dst-pan={}", pan)?;
+        }
+
+        if let Some(pan) = self.src_pan_id() {
+            write!(f, " src-pan={}", pan)?;
+        }
+
+        if let Some(addr) = self.dst_addr() {
+            write!(f, " dst={}", addr)?;
+        }
+
+        if let Some(addr) = self.src_addr() {
+            write!(f, " src={}", addr)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<T: AsRef<[u8]>> defmt::Format for Frame<T> {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "IEEE802.15.4 frame type={}", self.frame_type());
+
+        if let Some(seq) = self.sequence_number() {
+            defmt::write!(f, " seq={:02x}", seq);
+        }
+
+        if let Some(pan) = self.dst_pan_id() {
+            defmt::write!(f, " dst-pan={}", pan);
+        }
+
+        if let Some(pan) = self.src_pan_id() {
+            defmt::write!(f, " src-pan={}", pan);
+        }
+
+        if let Some(addr) = self.dst_addr() {
+            defmt::write!(f, " dst={}", addr);
+        }
+
+        if let Some(addr) = self.src_addr() {
+            defmt::write!(f, " src={}", addr);
+        }
     }
 }
 
@@ -784,7 +864,7 @@ impl Repr {
 
     /// Return the length of a buffer required to hold a packet with the payload of a given length.
     #[inline]
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         3 + 2
             + match self.dst_addr {
                 Some(Address::Absent) | None => 0,
@@ -832,7 +912,6 @@ impl Repr {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::Result;
 
     #[test]
     fn test_broadcast() {
@@ -865,7 +944,7 @@ mod test {
         let mut frame = Frame::new_unchecked(&mut buffer[..buffer_len]);
         repr.emit(&mut frame);
 
-        println!("{:2x?}", frame);
+        println!("{frame:2x?}");
 
         assert_eq!(frame.frame_type(), FrameType::Data);
         assert!(!frame.security_enabled());

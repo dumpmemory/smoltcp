@@ -21,7 +21,7 @@ enum_with_unknown! {
 }
 
 /// A read/write wrapper around an Address Resolution Protocol packet buffer.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
@@ -39,25 +39,25 @@ mod field {
     pub const OPER: Field = 6..8;
 
     #[inline]
-    pub fn SHA(hardware_len: u8, _protocol_len: u8) -> Field {
+    pub const fn SHA(hardware_len: u8, _protocol_len: u8) -> Field {
         let start = OPER.end;
         start..(start + hardware_len as usize)
     }
 
     #[inline]
-    pub fn SPA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub const fn SPA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = SHA(hardware_len, protocol_len).end;
         start..(start + protocol_len as usize)
     }
 
     #[inline]
-    pub fn THA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub const fn THA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = SPA(hardware_len, protocol_len).end;
         start..(start + hardware_len as usize)
     }
 
     #[inline]
-    pub fn TPA(hardware_len: u8, protocol_len: u8) -> Field {
+    pub const fn TPA(hardware_len: u8, protocol_len: u8) -> Field {
         let start = THA(hardware_len, protocol_len).end;
         start..(start + protocol_len as usize)
     }
@@ -65,7 +65,7 @@ mod field {
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with ARP packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -289,7 +289,7 @@ impl Repr {
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         match *self {
             Repr::EthernetIpv4 { .. } => field::TPA(6, 4).end,
         }
@@ -322,7 +322,7 @@ impl Repr {
 impl<T: AsRef<[u8]>> fmt::Display for Packet<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match Repr::parse(self) {
-            Ok(repr) => write!(f, "{}", repr),
+            Ok(repr) => write!(f, "{repr}"),
             _ => {
                 write!(f, "ARP (unrecognized)")?;
                 write!(
@@ -360,12 +360,7 @@ impl fmt::Display for Repr {
             } => {
                 write!(
                     f,
-                    "ARP type=Ethernet+IPv4 src={}/{} tgt={}/{} op={:?}",
-                    source_hardware_addr,
-                    source_protocol_addr,
-                    target_hardware_addr,
-                    target_protocol_addr,
-                    operation
+                    "ARP type=Ethernet+IPv4 src={source_hardware_addr}/{source_protocol_addr} tgt={target_hardware_addr}/{target_protocol_addr} op={operation:?}"
                 )
             }
         }
@@ -381,8 +376,8 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         match Packet::new_checked(buffer) {
-            Err(err) => write!(f, "{}({})", indent, err),
-            Ok(packet) => write!(f, "{}{}", indent, packet),
+            Err(err) => write!(f, "{indent}({err})"),
+            Ok(packet) => write!(f, "{indent}{packet}"),
         }
     }
 }
@@ -429,7 +424,7 @@ mod test {
         packet.set_source_protocol_addr(&[0x21, 0x22, 0x23, 0x24]);
         packet.set_target_hardware_addr(&[0x31, 0x32, 0x33, 0x34, 0x35, 0x36]);
         packet.set_target_protocol_addr(&[0x41, 0x42, 0x43, 0x44]);
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 
     fn packet_repr() -> Repr {
@@ -458,6 +453,6 @@ mod test {
         let mut bytes = vec![0xa5; 28];
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet_repr().emit(&mut packet);
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 }

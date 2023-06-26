@@ -2,10 +2,9 @@
 mod utils;
 
 use log::*;
-use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 
-use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache, Routes, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
@@ -28,21 +27,18 @@ fn main() {
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
-    let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    let ip_addrs = [IpCidr::new(Ipv4Address::UNSPECIFIED.into(), 0)];
-    let mut routes_storage = [None; 1];
-    let routes = Routes::new(&mut routes_storage[..]);
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
+    config.random_seed = rand::random();
+    let mut iface = Interface::new(config, &mut device, Instant::now());
 
-    let medium = device.capabilities().medium;
-    let mut builder = InterfaceBuilder::new().ip_addrs(ip_addrs).routes(routes);
-    if medium == Medium::Ethernet {
-        builder = builder
-            .hardware_addr(ethernet_addr.into())
-            .neighbor_cache(neighbor_cache);
-    }
-    let mut iface = builder.finalize(&mut device);
-
+    // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();
 
     // Set a ridiculously short max lease time to show DHCP renews work properly.
@@ -56,9 +52,7 @@ fn main() {
 
     loop {
         let timestamp = Instant::now();
-        if let Err(e) = iface.poll(timestamp, &mut device, &mut sockets) {
-            debug!("poll error: {}", e);
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
         match event {
@@ -78,9 +72,7 @@ fn main() {
                 }
 
                 for (i, s) in config.dns_servers.iter().enumerate() {
-                    if let Some(s) = s {
-                        debug!("DNS server {}:    {}", i, s);
-                    }
+                    debug!("DNS server {}:    {}", i, s);
                 }
             }
             Some(dhcpv4::Event::Deconfigured) => {
@@ -94,7 +86,7 @@ fn main() {
     }
 }
 
-fn set_ipv4_addr(iface: &mut Interface<'_>, cidr: Ipv4Cidr) {
+fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     iface.update_ip_addrs(|addrs| {
         let dest = addrs.iter_mut().next().unwrap();
         *dest = IpCidr::Ipv4(cidr);

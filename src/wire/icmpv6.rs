@@ -7,6 +7,8 @@ use crate::wire::ip::checksum;
 use crate::wire::MldRepr;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::wire::NdiscRepr;
+#[cfg(feature = "proto-rpl")]
+use crate::wire::RplRepr;
 use crate::wire::{IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr};
 
 enum_with_unknown! {
@@ -37,7 +39,9 @@ enum_with_unknown! {
         /// Redirect
         Redirect        = 0x89,
         /// Multicast Listener Report
-        MldReport       = 0x8f
+        MldReport       = 0x8f,
+        /// RPL Control Message
+        RplControl      = 0x9b,
     }
 }
 
@@ -55,7 +59,7 @@ impl Message {
     /// is an [NDISC] message type.
     ///
     /// [NDISC]: https://tools.ietf.org/html/rfc4861
-    pub fn is_ndisc(&self) -> bool {
+    pub const fn is_ndisc(&self) -> bool {
         match *self {
             Message::RouterSolicit
             | Message::RouterAdvert
@@ -70,7 +74,7 @@ impl Message {
     /// is an [MLD] message type.
     ///
     /// [MLD]: https://tools.ietf.org/html/rfc3810
-    pub fn is_mld(&self) -> bool {
+    pub const fn is_mld(&self) -> bool {
         match *self {
             Message::MldQuery | Message::MldReport => true,
             _ => false,
@@ -94,7 +98,8 @@ impl fmt::Display for Message {
             Message::Redirect => write!(f, "redirect"),
             Message::MldQuery => write!(f, "multicast listener query"),
             Message::MldReport => write!(f, "multicast listener report"),
-            Message::Unknown(id) => write!(f, "{}", id),
+            Message::RplControl => write!(f, "RPL control message"),
+            Message::Unknown(id) => write!(f, "{id}"),
         }
     }
 }
@@ -134,7 +139,7 @@ impl fmt::Display for DstUnreachable {
                 write!(f, "source address failed ingress/egress policy")
             }
             DstUnreachable::RejectRoute => write!(f, "reject route to destination"),
-            DstUnreachable::Unknown(id) => write!(f, "{}", id),
+            DstUnreachable::Unknown(id) => write!(f, "{id}"),
         }
     }
 }
@@ -157,7 +162,7 @@ impl fmt::Display for ParamProblem {
             ParamProblem::ErroneousHdrField => write!(f, "erroneous header field."),
             ParamProblem::UnrecognizedNxtHdr => write!(f, "unrecognized next header type."),
             ParamProblem::UnrecognizedOption => write!(f, "unrecognized IPv6 option."),
-            ParamProblem::Unknown(id) => write!(f, "{}", id),
+            ParamProblem::Unknown(id) => write!(f, "{id}"),
         }
     }
 }
@@ -177,13 +182,13 @@ impl fmt::Display for TimeExceeded {
         match *self {
             TimeExceeded::HopLimitExceeded => write!(f, "hop limit exceeded in transit"),
             TimeExceeded::FragReassemExceeded => write!(f, "fragment reassembly time exceeded"),
-            TimeExceeded::Unknown(id) => write!(f, "{}", id),
+            TimeExceeded::Unknown(id) => write!(f, "{id}"),
         }
     }
 }
 
 /// A read/write wrapper around an Internet Control Message Protocol version 6 packet buffer.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     pub(super) buffer: T,
@@ -247,7 +252,7 @@ pub(super) mod field {
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with ICMPv6 packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -265,11 +270,68 @@ impl<T: AsRef<[u8]>> Packet<T> {
     /// Returns `Err(Error)` if the buffer is too short.
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
-        if len < field::HEADER_END || len < self.header_len() {
-            Err(Error)
-        } else {
-            Ok(())
+
+        if len < 4 {
+            return Err(Error);
         }
+
+        match self.msg_type() {
+            Message::DstUnreachable
+            | Message::PktTooBig
+            | Message::TimeExceeded
+            | Message::ParamProblem
+            | Message::EchoRequest
+            | Message::EchoReply
+            | Message::MldQuery
+            | Message::RouterSolicit
+            | Message::RouterAdvert
+            | Message::NeighborSolicit
+            | Message::NeighborAdvert
+            | Message::Redirect
+            | Message::MldReport => {
+                if len < field::HEADER_END || len < self.header_len() {
+                    return Err(Error);
+                }
+            }
+            #[cfg(feature = "proto-rpl")]
+            Message::RplControl => match super::rpl::RplControlMessage::from(self.msg_code()) {
+                super::rpl::RplControlMessage::DodagInformationSolicitation => {
+                    // TODO(thvdveld): replace magic number
+                    if len < 6 {
+                        return Err(Error);
+                    }
+                }
+                super::rpl::RplControlMessage::DodagInformationObject => {
+                    // TODO(thvdveld): replace magic number
+                    if len < 28 {
+                        return Err(Error);
+                    }
+                }
+                super::rpl::RplControlMessage::DestinationAdvertisementObject => {
+                    // TODO(thvdveld): replace magic number
+                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
+                        return Err(Error);
+                    }
+                }
+                super::rpl::RplControlMessage::DestinationAdvertisementObjectAck => {
+                    // TODO(thvdveld): replace magic number
+                    if len < 8 || (self.dao_dodag_id_present() && len < 24) {
+                        return Err(Error);
+                    }
+                }
+                super::rpl::RplControlMessage::SecureDodagInformationSolicitation
+                | super::rpl::RplControlMessage::SecureDodagInformationObject
+                | super::rpl::RplControlMessage::SecureDesintationAdvertismentObject
+                | super::rpl::RplControlMessage::SecureDestinationAdvertisementObjectAck
+                | super::rpl::RplControlMessage::ConsistencyCheck => return Err(Error),
+                super::rpl::RplControlMessage::Unknown(_) => return Err(Error),
+            },
+            #[cfg(not(feature = "proto-rpl"))]
+            Message::RplControl => return Err(Error),
+            Message::Unknown(_) => return Err(Error),
+        }
+
+        Ok(())
     }
 
     /// Consume the packet, returning the underlying buffer.
@@ -418,7 +480,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
                 let data = self.buffer.as_mut();
                 NetworkEndian::write_u16(&mut data[field::RECORD_RESV], 0);
             }
-            ty => panic!("Message type `{}` does not have any reserved fields.", ty),
+            ty => panic!("Message type `{ty}` does not have any reserved fields."),
         }
     }
 
@@ -535,6 +597,8 @@ pub enum Repr<'a> {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     Ndisc(NdiscRepr<'a>),
     Mld(MldRepr<'a>),
+    #[cfg(feature = "proto-rpl")]
+    Rpl(RplRepr<'a>),
 }
 
 impl<'a> Repr<'a> {
@@ -555,7 +619,7 @@ impl<'a> Repr<'a> {
         {
             let ip_packet = Ipv6Packet::new_checked(packet.payload())?;
 
-            let payload = &packet.payload()[ip_packet.header_len() as usize..];
+            let payload = &packet.payload()[ip_packet.header_len()..];
             if payload.len() < 8 {
                 return Err(Error);
             }
@@ -620,6 +684,8 @@ impl<'a> Repr<'a> {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             (msg_type, 0) if msg_type.is_ndisc() => NdiscRepr::parse(packet).map(Repr::Ndisc),
             (msg_type, 0) if msg_type.is_mld() => MldRepr::parse(packet).map(Repr::Mld),
+            #[cfg(feature = "proto-rpl")]
+            (Message::RplControl, _) => RplRepr::parse(packet).map(Repr::Rpl),
             _ => Err(Error),
         }
     }
@@ -639,6 +705,8 @@ impl<'a> Repr<'a> {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             &Repr::Ndisc(ndisc) => ndisc.buffer_len(),
             &Repr::Mld(mld) => mld.buffer_len(),
+            #[cfg(feature = "proto-rpl")]
+            Repr::Rpl(rpl) => rpl.buffer_len(),
         }
     }
 
@@ -734,6 +802,9 @@ impl<'a> Repr<'a> {
             Repr::Ndisc(ndisc) => ndisc.emit(packet),
 
             Repr::Mld(mld) => mld.emit(packet),
+
+            #[cfg(feature = "proto-rpl")]
+            Repr::Rpl(ref rpl) => rpl.emit(packet),
         }
 
         if checksum_caps.icmpv6.tx() {
@@ -828,7 +899,7 @@ mod test {
             .payload_mut()
             .copy_from_slice(&ECHO_PACKET_PAYLOAD[..]);
         packet.fill_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2);
-        assert_eq!(&packet.into_inner()[..], &ECHO_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &ECHO_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -855,7 +926,7 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &ECHO_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &ECHO_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -881,7 +952,7 @@ mod test {
             .payload_mut()
             .copy_from_slice(&PKT_TOO_BIG_IP_PAYLOAD[..]);
         packet.fill_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2);
-        assert_eq!(&packet.into_inner()[..], &PKT_TOO_BIG_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PKT_TOO_BIG_BYTES[..]);
     }
 
     #[test]
@@ -908,6 +979,6 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &PKT_TOO_BIG_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PKT_TOO_BIG_BYTES[..]);
     }
 }

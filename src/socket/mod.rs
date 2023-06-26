@@ -66,7 +66,7 @@ pub enum Socket<'a> {
     #[cfg(feature = "socket-tcp")]
     Tcp(tcp::Socket<'a>),
     #[cfg(feature = "socket-dhcpv4")]
-    Dhcpv4(dhcpv4::Socket),
+    Dhcpv4(dhcpv4::Socket<'a>),
     #[cfg(feature = "socket-dns")]
     Dns(dns::Socket<'a>),
 }
@@ -91,10 +91,14 @@ impl<'a> Socket<'a> {
 }
 
 /// A conversion trait for network sockets.
-pub trait AnySocket<'a>: Sized {
+pub trait AnySocket<'a> {
     fn upcast(self) -> Socket<'a>;
-    fn downcast<'c>(socket: &'c Socket<'a>) -> Option<&'c Self>;
-    fn downcast_mut<'c>(socket: &'c mut Socket<'a>) -> Option<&'c mut Self>;
+    fn downcast<'c>(socket: &'c Socket<'a>) -> Option<&'c Self>
+    where
+        Self: Sized;
+    fn downcast_mut<'c>(socket: &'c mut Socket<'a>) -> Option<&'c mut Self>
+    where
+        Self: Sized;
 }
 
 macro_rules! from_socket {
@@ -132,6 +136,6 @@ from_socket!(udp::Socket<'a>, Udp);
 #[cfg(feature = "socket-tcp")]
 from_socket!(tcp::Socket<'a>, Tcp);
 #[cfg(feature = "socket-dhcpv4")]
-from_socket!(dhcpv4::Socket, Dhcpv4);
+from_socket!(dhcpv4::Socket<'a>, Dhcpv4);
 #[cfg(feature = "socket-dns")]
 from_socket!(dns::Socket<'a>, Dns);

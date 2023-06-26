@@ -15,14 +15,13 @@ use core::{fmt, ops};
 /// A representation of an absolute time value.
 ///
 /// The `Instant` type is a wrapper around a `i64` value that
-/// represents a number of milliseconds, monotonically increasing
+/// represents a number of microseconds, monotonically increasing
 /// since an arbitrary moment in time, such as system startup.
 ///
 /// * A value of `0` is inherently arbitrary.
 /// * A value less than `0` indicates a time before the starting
 ///   point.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Instant {
     micros: i64,
 }
@@ -130,7 +129,14 @@ impl From<Instant> for ::std::time::SystemTime {
 
 impl fmt::Display for Instant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{}s", self.secs(), self.millis())
+        write!(f, "{}.{:0>3}s", self.secs(), self.millis())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Instant {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
     }
 }
 
@@ -172,7 +178,6 @@ impl ops::Sub<Instant> for Instant {
 
 /// A relative amount of time.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Duration {
     micros: u64,
 }
@@ -227,6 +232,13 @@ impl Duration {
 impl fmt::Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}.{:03}s", self.secs(), self.millis())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Duration {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "{}.{:03}s", self.secs(), self.millis());
     }
 }
 
@@ -361,8 +373,9 @@ mod test {
 
     #[test]
     fn test_instant_display() {
+        assert_eq!(format!("{}", Instant::from_millis(74)), "0.074s");
         assert_eq!(format!("{}", Instant::from_millis(5674)), "5.674s");
-        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.0s");
+        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.000s");
     }
 
     #[test]

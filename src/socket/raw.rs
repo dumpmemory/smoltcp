@@ -22,6 +22,18 @@ pub enum BindError {
     Unaddressable,
 }
 
+impl core::fmt::Display for BindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            BindError::InvalidState => write!(f, "invalid state"),
+            BindError::Unaddressable => write!(f, "unaddressable"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BindError {}
+
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -29,12 +41,34 @@ pub enum SendError {
     BufferFull,
 }
 
+impl core::fmt::Display for SendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            SendError::BufferFull => write!(f, "buffer full"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SendError {}
+
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RecvError {
     Exhausted,
 }
+
+impl core::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            RecvError::Exhausted => write!(f, "exhausted"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RecvError {}
 
 /// A UDP packet metadata.
 pub type PacketMetadata = crate::storage::PacketMetadata<()>;
@@ -247,6 +281,36 @@ impl<'a> Socket<'a> {
         Ok(length)
     }
 
+    /// Peek at a packet in the receive buffer and return a pointer to the
+    /// payload without removing the packet from the receive buffer.
+    /// This function otherwise behaves identically to [recv](#method.recv).
+    ///
+    /// It returns `Err(Error::Exhausted)` if the receive buffer is empty.
+    pub fn peek(&mut self) -> Result<&[u8], RecvError> {
+        let ((), packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
+
+        net_trace!(
+            "raw:{}:{}: receive {} buffered octets",
+            self.ip_version,
+            self.ip_protocol,
+            packet_buf.len()
+        );
+
+        Ok(packet_buf)
+    }
+
+    /// Peek at a packet in the receive buffer, copy the payload into the given slice,
+    /// and return the amount of octets copied without removing the packet from the receive buffer.
+    /// This function otherwise behaves identically to [recv_slice](#method.recv_slice).
+    ///
+    /// See also [peek](#method.peek).
+    pub fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
+        let buffer = self.peek()?;
+        let length = min(data.len(), buffer.len());
+        data[..length].copy_from_slice(&buffer[..length]);
+        Ok(length)
+    }
+
     pub(crate) fn accepts(&self, ip_repr: &IpRepr) -> bool {
         if ip_repr.version() != self.ip_version {
             return false;
@@ -261,7 +325,7 @@ impl<'a> Socket<'a> {
     pub(crate) fn process(&mut self, cx: &mut Context, ip_repr: &IpRepr, payload: &[u8]) {
         debug_assert!(self.accepts(ip_repr));
 
-        let header_len = ip_repr.buffer_len();
+        let header_len = ip_repr.header_len();
         let total_len = header_len + payload.len();
 
         net_trace!(
@@ -387,7 +451,6 @@ mod test {
     use crate::wire::{Ipv4Address, Ipv4Repr};
     #[cfg(feature = "proto-ipv6")]
     use crate::wire::{Ipv6Address, Ipv6Repr};
-    use crate::Error;
 
     fn buffer(packets: usize) -> PacketBuffer<'static> {
         PacketBuffer::new(vec![PacketMetadata::EMPTY; packets], vec![0; 48 * packets])
@@ -484,7 +547,7 @@ mod test {
                     assert!(socket.can_send());
                     assert_eq!(
                         socket.dispatch(&mut cx, |_, _| unreachable!()),
-                        Ok::<_, Error>(())
+                        Ok::<_, ()>(())
                     );
 
                     assert_eq!(socket.send_slice(&$packet[..]), Ok(()));
@@ -495,9 +558,9 @@ mod test {
                         socket.dispatch(&mut cx, |_, (ip_repr, ip_payload)| {
                             assert_eq!(ip_repr, $hdr);
                             assert_eq!(ip_payload, &$payload);
-                            Err(Error::Unaddressable)
+                            Err(())
                         }),
-                        Err(Error::Unaddressable)
+                        Err(())
                     );
                     assert!(!socket.can_send());
 
@@ -505,7 +568,7 @@ mod test {
                         socket.dispatch(&mut cx, |_, (ip_repr, ip_payload)| {
                             assert_eq!(ip_repr, $hdr);
                             assert_eq!(ip_payload, &$payload);
-                            Ok::<_, Error>(())
+                            Ok::<_, ()>(())
                         }),
                         Ok(())
                     );
@@ -535,6 +598,22 @@ mod test {
 
                     assert!(socket.accepts(&$hdr));
                     socket.process(&mut cx, &$hdr, &buffer);
+                }
+
+                #[test]
+                fn test_peek_truncated_slice() {
+                    let mut socket = $socket(buffer(1), buffer(0));
+                    let mut cx = Context::mock();
+
+                    assert!(socket.accepts(&$hdr));
+                    socket.process(&mut cx, &$hdr, &$payload);
+
+                    let mut slice = [0; 4];
+                    assert_eq!(socket.peek_slice(&mut slice[..]), Ok(4));
+                    assert_eq!(&slice, &$packet[..slice.len()]);
+                    assert_eq!(socket.recv_slice(&mut slice[..]), Ok(4));
+                    assert_eq!(&slice, &$packet[..slice.len()]);
+                    assert_eq!(socket.peek_slice(&mut slice[..]), Err(RecvError::Exhausted));
                 }
             }
         };
@@ -572,7 +651,7 @@ mod test {
             assert_eq!(socket.send_slice(&wrong_version[..]), Ok(()));
             assert_eq!(
                 socket.dispatch(&mut cx, |_, _| unreachable!()),
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             );
 
             let mut wrong_protocol = ipv4_locals::PACKET_BYTES;
@@ -581,7 +660,7 @@ mod test {
             assert_eq!(socket.send_slice(&wrong_protocol[..]), Ok(()));
             assert_eq!(
                 socket.dispatch(&mut cx, |_, _| unreachable!()),
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             );
         }
         #[cfg(feature = "proto-ipv6")]
@@ -595,7 +674,7 @@ mod test {
             assert_eq!(socket.send_slice(&wrong_version[..]), Ok(()));
             assert_eq!(
                 socket.dispatch(&mut cx, |_, _| unreachable!()),
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             );
 
             let mut wrong_protocol = ipv6_locals::PACKET_BYTES;
@@ -604,7 +683,7 @@ mod test {
             assert_eq!(socket.send_slice(&wrong_protocol[..]), Ok(()));
             assert_eq!(
                 socket.dispatch(&mut cx, |_, _| unreachable!()),
-                Ok::<_, Error>(())
+                Ok::<_, ()>(())
             );
         }
     }
@@ -661,6 +740,59 @@ mod test {
             );
             assert_eq!(socket.recv(), Ok(&ipv6_locals::PACKET_BYTES[..]));
             assert!(!socket.can_recv());
+        }
+    }
+
+    #[test]
+    fn test_peek_process() {
+        #[cfg(feature = "proto-ipv4")]
+        {
+            let mut socket = ipv4_locals::socket(buffer(1), buffer(0));
+            let mut cx = Context::mock();
+
+            let mut cksumd_packet = ipv4_locals::PACKET_BYTES;
+            Ipv4Packet::new_unchecked(&mut cksumd_packet).fill_checksum();
+
+            assert_eq!(socket.peek(), Err(RecvError::Exhausted));
+            assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
+            socket.process(
+                &mut cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+            );
+
+            assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
+            socket.process(
+                &mut cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+            );
+            assert_eq!(socket.peek(), Ok(&cksumd_packet[..]));
+            assert_eq!(socket.recv(), Ok(&cksumd_packet[..]));
+            assert_eq!(socket.peek(), Err(RecvError::Exhausted));
+        }
+        #[cfg(feature = "proto-ipv6")]
+        {
+            let mut socket = ipv6_locals::socket(buffer(1), buffer(0));
+            let mut cx = Context::mock();
+
+            assert_eq!(socket.peek(), Err(RecvError::Exhausted));
+            assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
+            socket.process(
+                &mut cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+            );
+
+            assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
+            socket.process(
+                &mut cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+            );
+            assert_eq!(socket.peek(), Ok(&ipv6_locals::PACKET_BYTES[..]));
+            assert_eq!(socket.recv(), Ok(&ipv6_locals::PACKET_BYTES[..]));
+            assert_eq!(socket.peek(), Err(RecvError::Exhausted));
         }
     }
 

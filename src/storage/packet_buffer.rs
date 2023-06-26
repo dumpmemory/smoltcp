@@ -82,6 +82,12 @@ impl<'a, H> PacketBuffer<'a, H> {
             return Err(Full);
         }
 
+        // Ring is currently empty.  Clear it (resetting `read_at`) to maximize
+        // for contiguous space.
+        if self.payload_ring.is_empty() {
+            self.payload_ring.clear();
+        }
+
         let window = self.payload_ring.window();
         let contig_window = self.payload_ring.contiguous_window();
 
@@ -158,15 +164,10 @@ impl<'a, H> PacketBuffer<'a, H> {
     }
 
     fn dequeue_padding(&mut self) {
-        let Self {
-            ref mut metadata_ring,
-            ref mut payload_ring,
-        } = *self;
-
-        let _ = metadata_ring.dequeue_one_with(|metadata| {
+        let _ = self.metadata_ring.dequeue_one_with(|metadata| {
             if metadata.is_padding() {
                 // note(discard): function does not use value of dequeued padding bytes
-                let _buf_dequeued = payload_ring.dequeue_many(metadata.size);
+                let _buf_dequeued = self.payload_ring.dequeue_many(metadata.size);
                 Ok(()) // dequeue metadata
             } else {
                 Err(()) // don't dequeue metadata
@@ -182,23 +183,16 @@ impl<'a, H> PacketBuffer<'a, H> {
     {
         self.dequeue_padding();
 
-        let Self {
-            ref mut metadata_ring,
-            ref mut payload_ring,
-        } = *self;
-
-        metadata_ring.dequeue_one_with(move |metadata| {
-            let PacketMetadata {
-                ref mut header,
-                size,
-            } = *metadata;
-
-            payload_ring
+        self.metadata_ring.dequeue_one_with(|metadata| {
+            self.payload_ring
                 .dequeue_many_with(|payload_buf| {
-                    debug_assert!(payload_buf.len() >= size);
+                    debug_assert!(payload_buf.len() >= metadata.size);
 
-                    match f(header.as_mut().unwrap(), &mut payload_buf[..size]) {
-                        Ok(val) => (size, Ok(val)),
+                    match f(
+                        metadata.header.as_mut().unwrap(),
+                        &mut payload_buf[..metadata.size],
+                    ) {
+                        Ok(val) => (metadata.size, Ok(val)),
                         Err(err) => (0, Err(err)),
                     }
                 })
@@ -211,14 +205,11 @@ impl<'a, H> PacketBuffer<'a, H> {
     pub fn dequeue(&mut self) -> Result<(H, &mut [u8]), Empty> {
         self.dequeue_padding();
 
-        let PacketMetadata {
-            ref mut header,
-            size,
-        } = *self.metadata_ring.dequeue_one()?;
+        let meta = self.metadata_ring.dequeue_one()?;
 
-        let payload_buf = self.payload_ring.dequeue_many(size);
-        debug_assert!(payload_buf.len() == size);
-        Ok((header.take().unwrap(), payload_buf))
+        let payload_buf = self.payload_ring.dequeue_many(meta.size);
+        debug_assert!(payload_buf.len() == meta.size);
+        Ok((meta.header.take().unwrap(), payload_buf))
     }
 
     /// Peek at a single packet from the buffer without removing it, and return a reference to
@@ -371,6 +362,14 @@ mod test {
         assert!(buffer.dequeue().is_ok());
         assert_eq!(buffer.enqueue(8, ()), Err(Full));
         assert_eq!(buffer.metadata_ring.len(), 1);
+    }
+
+    #[test]
+    fn test_contiguous_window_wrap() {
+        let mut buffer = buffer();
+        assert!(buffer.enqueue(15, ()).is_ok());
+        assert!(buffer.dequeue().is_ok());
+        assert!(buffer.enqueue(16, ()).is_ok());
     }
 
     #[test]

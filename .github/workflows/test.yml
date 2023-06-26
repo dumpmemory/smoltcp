@@ -1,87 +1,64 @@
 on:
-  push:
-    branches: [staging, trying]
   pull_request:
+  merge_group:
 
 name: Test
 
 jobs:
   tests:
-    runs-on: ubuntu-20.04
-    needs: [test, check]
+    runs-on: ubuntu-22.04
+    needs: [check-msrv, test-msrv, test-stable, clippy]
     steps:
       - name: Done
         run: exit 0
-  test:
-    runs-on: ubuntu-20.04
-    continue-on-error: ${{ matrix.rust == 'nightly' }}
-    strategy:
-      matrix:
-        # Test on stable, MSRV, and nightly.
-        # Failure is permitted on nightly.
-        rust:
-          - stable
-          - 1.56.0
-          - nightly
 
-        features:
-          # Test default features.
-          - default
-
-          # Test minimal featureset
-          - std proto-ipv4
-
-          # Test features chosen to be as orthogonal as possible.
-          - std medium-ethernet phy-raw_socket proto-ipv6 socket-udp socket-dns
-          - std medium-ethernet phy-tuntap_interface proto-ipv6 socket-udp
-          - std medium-ethernet proto-ipv4 proto-igmp socket-raw socket-dns
-          - std medium-ethernet proto-ipv4 socket-udp socket-tcp socket-dns
-          - std medium-ethernet proto-ipv4 proto-dhcpv4 socket-udp
-          - std medium-ethernet medium-ip medium-ieee802154 proto-ipv6 socket-udp socket-dns
-          - std medium-ethernet proto-ipv6 socket-tcp
-          - std medium-ethernet medium-ip proto-ipv4 socket-icmp socket-tcp
-          - std medium-ip proto-ipv6 socket-icmp socket-tcp
-
-          # Test features chosen to be as aggressive as possible.
-          - std medium-ethernet medium-ip medium-ieee802154 proto-ipv4 proto-ipv6 socket-raw socket-udp socket-tcp socket-icmp socket-dns async
-
-        include:
-          # Test alloc feature which requires nightly.
-          - rust: nightly
-            features: alloc medium-ethernet proto-ipv4 proto-ipv6 socket-raw socket-udp socket-tcp socket-icmp
+  check-msrv:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - name: Run Tests
-        run: cargo test --no-default-features --features "${{ matrix.features }}"
+      - name: Run Checks MSRV
+        run: ./ci.sh check msrv
 
-  check:
-    runs-on: ubuntu-20.04
-    continue-on-error: ${{ matrix.rust == 'nightly' }}
-    strategy:
-      matrix:
-        # Test on stable, MSRV, and nightly.
-        # Failure is permitted on nightly.
-        rust:
-          - stable
-          - 1.56.0
-          - nightly
-
-        features:
-          # These feature sets cannot run tests, so we only check they build.
-          - medium-ip medium-ethernet medium-ieee802154 proto-ipv6 proto-ipv6 proto-igmp proto-dhcpv4 socket-raw socket-udp socket-tcp socket-icmp socket-dns async
-          - defmt medium-ip medium-ethernet proto-ipv6 proto-ipv6 proto-igmp proto-dhcpv4 socket-raw socket-udp socket-tcp socket-icmp socket-dns async
-
+  test-msrv:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - name: Check
-        run: cargo check --no-default-features --features "${{ matrix.features }}"
+      - name: Run Tests MSRV
+        run: ./ci.sh test msrv
+
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Clippy
+        run: ./ci.sh clippy
+
+  test-stable:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Tests stable
+        run: ./ci.sh test stable
+
+  test-nightly:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Tests nightly
+        run: ./ci.sh test nightly
+
+  #check-stable:
+    #runs-on: ubuntu-22.04
+    #steps:
+      #- uses: actions/checkout@v2
+      #- name: Run Tests
+        #run: ./ci.sh check stable
+
+  #check-nightly:
+    #runs-on: ubuntu-22.04
+    #continue-on-error: true
+    #steps:
+      #- uses: actions/checkout@v2
+      #- name: Run Tests
+        #run: ./ci.sh check nightly

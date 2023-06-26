@@ -2,10 +2,17 @@
 //! IEEE802.154-based networks.
 //!
 //! [RFC 6282]: https://datatracker.ietf.org/doc/html/rfc6282
+
 use super::{Error, Result};
 use crate::wire::ieee802154::Address as LlAddress;
 use crate::wire::ipv6;
 use crate::wire::IpProtocol;
+
+const ADDRESS_CONTEXT_LENGTH: usize = 8;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct AddressContext(pub [u8; ADDRESS_CONTEXT_LENGTH]);
 
 /// The representation of an unresolved address. 6LoWPAN compression of IPv6 addresses can be with
 /// and without context information. The decompression with context information is not yet
@@ -14,7 +21,7 @@ use crate::wire::IpProtocol;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UnresolvedAddress<'a> {
     WithoutContext(AddressMode<'a>),
-    WithContext(AddressMode<'a>),
+    WithContext((usize, AddressMode<'a>)),
     Reserved,
 }
 
@@ -51,8 +58,24 @@ const LINK_LOCAL_PREFIX: [u8; 2] = [0xfe, 0x80];
 const EUI64_MIDDLE_VALUE: [u8; 2] = [0xff, 0xfe];
 
 impl<'a> UnresolvedAddress<'a> {
-    pub fn resolve(self, ll_address: Option<LlAddress>) -> Result<ipv6::Address> {
+    pub fn resolve(
+        self,
+        ll_address: Option<LlAddress>,
+        addr_context: &[AddressContext],
+    ) -> Result<ipv6::Address> {
         let mut bytes = [0; 16];
+
+        let copy_context = |index: usize, bytes: &mut [u8]| -> Result<()> {
+            if index >= addr_context.len() {
+                return Err(Error);
+            }
+
+            let context = addr_context[index];
+            bytes[..ADDRESS_CONTEXT_LENGTH].copy_from_slice(&context.0);
+
+            Ok(())
+        };
+
         match self {
             UnresolvedAddress::WithoutContext(mode) => match mode {
                 AddressMode::FullInline(addr) => Ok(ipv6::Address::from_bytes(addr)),
@@ -104,8 +127,35 @@ impl<'a> UnresolvedAddress<'a> {
                 _ => Err(Error),
             },
             UnresolvedAddress::WithContext(mode) => match mode {
-                AddressMode::Unspecified => Ok(ipv6::Address::UNSPECIFIED),
-                AddressMode::NotSupported => Err(Error),
+                (_, AddressMode::Unspecified) => Ok(ipv6::Address::UNSPECIFIED),
+                (index, AddressMode::InLine64bits(inline)) => {
+                    copy_context(index, &mut bytes[..])?;
+                    bytes[16 - inline.len()..].copy_from_slice(inline);
+                    Ok(ipv6::Address::from_bytes(&bytes[..]))
+                }
+                (index, AddressMode::InLine16bits(inline)) => {
+                    copy_context(index, &mut bytes[..])?;
+                    bytes[16 - inline.len()..].copy_from_slice(inline);
+                    Ok(ipv6::Address::from_bytes(&bytes[..]))
+                }
+                (index, AddressMode::FullyElided) => {
+                    match ll_address {
+                        Some(LlAddress::Short(ll)) => {
+                            bytes[11..13].copy_from_slice(&EUI64_MIDDLE_VALUE[..]);
+                            bytes[14..].copy_from_slice(&ll);
+                        }
+                        Some(addr @ LlAddress::Extended(_)) => match addr.as_eui_64() {
+                            Some(addr) => bytes[8..].copy_from_slice(&addr),
+                            None => return Err(Error),
+                        },
+                        Some(LlAddress::Absent) => return Err(Error),
+                        None => return Err(Error),
+                    }
+
+                    copy_context(index, &mut bytes[..])?;
+
+                    Ok(ipv6::Address::from_bytes(&bytes[..]))
+                }
                 _ => Err(Error),
             },
             UnresolvedAddress::Reserved => Err(Error),
@@ -157,19 +207,18 @@ pub mod frag {
     //! [RFC 4944 § 5.3]: https://datatracker.ietf.org/doc/html/rfc4944#section-5.3
 
     use super::{DISPATCH_FIRST_FRAGMENT_HEADER, DISPATCH_FRAGMENT_HEADER};
-    use crate::{
-        wire::{Ieee802154Address, Ieee802154Repr},
-        Error, Result,
-    };
+    use crate::wire::{Error, Result};
+    use crate::wire::{Ieee802154Address, Ieee802154Repr};
     use byteorder::{ByteOrder, NetworkEndian};
 
     /// Key used for identifying all the link fragments that belong to the same packet.
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct Key {
-        ll_src_addr: Ieee802154Address,
-        ll_dst_addr: Ieee802154Address,
-        datagram_size: u16,
-        datagram_tag: u16,
+        pub(crate) ll_src_addr: Ieee802154Address,
+        pub(crate) ll_dst_addr: Ieee802154Address,
+        pub(crate) datagram_size: u16,
+        pub(crate) datagram_tag: u16,
     }
 
     /// A read/write wrapper around a 6LoWPAN Fragment header.
@@ -219,7 +268,7 @@ pub mod frag {
 
     impl<T: AsRef<[u8]>> Packet<T> {
         /// Input a raw octet buffer with a 6LoWPAN Fragment header structure.
-        pub fn new_unchecked(buffer: T) -> Self {
+        pub const fn new_unchecked(buffer: T) -> Self {
             Self { buffer }
         }
 
@@ -234,18 +283,18 @@ pub mod frag {
             let dispatch = packet.dispatch();
 
             if dispatch != DISPATCH_FIRST_FRAGMENT_HEADER && dispatch != DISPATCH_FRAGMENT_HEADER {
-                return Err(Error::Malformed);
+                return Err(Error);
             }
 
             Ok(packet)
         }
 
         /// Ensure that no accessor method will panic if called.
-        /// Returns `Err(Error::Truncated)` if the buffer is too short.
+        /// Returns `Err(Error)` if the buffer is too short.
         pub fn check_len(&self) -> Result<()> {
             let buffer = self.buffer.as_ref();
             if buffer.is_empty() {
-                return Err(Error::Truncated);
+                return Err(Error);
             }
 
             match self.dispatch() {
@@ -253,13 +302,11 @@ pub mod frag {
                     Ok(())
                 }
                 DISPATCH_FIRST_FRAGMENT_HEADER if buffer.len() < FIRST_FRAGMENT_HEADER_SIZE => {
-                    Err(Error::Truncated)
+                    Err(Error)
                 }
                 DISPATCH_FRAGMENT_HEADER if buffer.len() >= NEXT_FRAGMENT_HEADER_SIZE => Ok(()),
-                DISPATCH_FRAGMENT_HEADER if buffer.len() < NEXT_FRAGMENT_HEADER_SIZE => {
-                    Err(Error::Truncated)
-                }
-                _ => Err(Error::Unrecognized),
+                DISPATCH_FRAGMENT_HEADER if buffer.len() < NEXT_FRAGMENT_HEADER_SIZE => Err(Error),
+                _ => Err(Error),
             }
         }
 
@@ -358,10 +405,36 @@ pub mod frag {
 
     /// A high-level representation of a 6LoWPAN Fragment header.
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub enum Repr {
         FirstFragment { size: u16, tag: u16 },
         Fragment { size: u16, tag: u16, offset: u8 },
+    }
+
+    impl core::fmt::Display for Repr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Repr::FirstFragment { size, tag } => {
+                    write!(f, "FirstFrag size={size} tag={tag}")
+                }
+                Repr::Fragment { size, tag, offset } => {
+                    write!(f, "NthFrag size={size} tag={tag} offset={offset}")
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "defmt")]
+    impl defmt::Format for Repr {
+        fn format(&self, fmt: defmt::Formatter) {
+            match self {
+                Repr::FirstFragment { size, tag } => {
+                    defmt::write!(fmt, "FirstFrag size={} tag={}", size, tag);
+                }
+                Repr::Fragment { size, tag, offset } => {
+                    defmt::write!(fmt, "NthFrag size={} tag={} offset={}", size, tag, offset);
+                }
+            }
+        }
     }
 
     impl Repr {
@@ -377,12 +450,12 @@ pub mod frag {
                     tag,
                     offset: packet.datagram_offset(),
                 }),
-                _ => Err(Error::Malformed),
+                _ => Err(Error),
             }
         }
 
         /// Returns the length of the Fragment header.
-        pub fn buffer_len(&self) -> usize {
+        pub const fn buffer_len(&self) -> usize {
             match self {
                 Self::FirstFragment { .. } => field::FIRST_FRAGMENT_REST.start,
                 Self::Fragment { .. } => field::NEXT_FRAGMENT_REST.start,
@@ -409,10 +482,28 @@ pub mod frag {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum NextHeader {
     Compressed,
     Uncompressed(IpProtocol),
+}
+
+impl core::fmt::Display for NextHeader {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NextHeader::Compressed => write!(f, "compressed"),
+            NextHeader::Uncompressed(protocol) => write!(f, "{protocol}"),
+        }
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for NextHeader {
+    fn format(&self, fmt: defmt::Formatter) {
+        match self {
+            NextHeader::Compressed => defmt::write!(fmt, "compressed"),
+            NextHeader::Uncompressed(protocol) => defmt::write!(fmt, "{}", protocol),
+        }
+    }
 }
 
 pub mod iphc {
@@ -421,7 +512,10 @@ pub mod iphc {
     //!
     //! [RFC 6282 § 3.1]: https://datatracker.ietf.org/doc/html/rfc6282#section-3.1
 
-    use super::{AddressMode, Error, NextHeader, Result, UnresolvedAddress, DISPATCH_IPHC_HEADER};
+    use super::{
+        AddressContext, AddressMode, Error, NextHeader, Result, UnresolvedAddress,
+        DISPATCH_IPHC_HEADER,
+    };
     use crate::wire::{ieee802154::Address as LlAddress, ipv6, IpProtocol};
     use byteorder::{ByteOrder, NetworkEndian};
 
@@ -492,7 +586,7 @@ pub mod iphc {
 
     impl<T: AsRef<[u8]>> Packet<T> {
         /// Input a raw octet buffer with a 6LoWPAN IPHC header structure.
-        pub fn new_unchecked(buffer: T) -> Self {
+        pub const fn new_unchecked(buffer: T) -> Self {
             Packet { buffer }
         }
 
@@ -573,7 +667,7 @@ pub mod iphc {
         pub fn src_context_id(&self) -> Option<u8> {
             if self.cid_field() == 1 {
                 let data = self.buffer.as_ref();
-                Some(data[1] >> 4)
+                Some(data[2] >> 4)
             } else {
                 None
             }
@@ -583,7 +677,7 @@ pub mod iphc {
         pub fn dst_context_id(&self) -> Option<u8> {
             if self.cid_field() == 1 {
                 let data = self.buffer.as_ref();
-                Some(data[1] & 0x0f)
+                Some(data[2] & 0x0f)
             } else {
                 None
             }
@@ -606,7 +700,7 @@ pub mod iphc {
             match self.tf_field() {
                 0b00 | 0b10 => {
                     let start = self.ip_fields_start() as usize;
-                    Some(self.buffer.as_ref()[start..][0] & 0b1111_11)
+                    Some(self.buffer.as_ref()[start..][0] & 0b111111)
                 }
                 0b01 | 0b11 => None,
                 _ => unreachable!(),
@@ -640,30 +734,52 @@ pub mod iphc {
                 + self.next_header_size()
                 + self.hop_limit_size()) as usize;
 
+            let data = self.buffer.as_ref();
             match (self.sac_field(), self.sam_field()) {
-                (0, 0b00) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                        &data[start..][..16],
-                    )))
-                }
-                (0, 0b01) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::InLine64bits(&data[start..][..8]),
-                    ))
-                }
-                (0, 0b10) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::InLine16bits(&data[start..][..2]),
-                    ))
-                }
+                (0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
+                    &data[start..][..16],
+                ))),
+                (0, 0b01) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::InLine64bits(&data[start..][..8]),
+                )),
+                (0, 0b10) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::InLine16bits(&data[start..][..2]),
+                )),
                 (0, 0b11) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided)),
-                (1, 0b00) => Ok(UnresolvedAddress::WithContext(AddressMode::Unspecified)),
-                (1, 0b01) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
-                (1, 0b10) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
-                (1, 0b11) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
+                (1, 0b00) => Ok(UnresolvedAddress::WithContext((
+                    0,
+                    AddressMode::Unspecified,
+                ))),
+                (1, 0b01) => {
+                    if let Some(id) = self.src_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::InLine64bits(&data[start..][..8]),
+                        )))
+                    } else {
+                        Err(Error)
+                    }
+                }
+                (1, 0b10) => {
+                    if let Some(id) = self.src_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::InLine16bits(&data[start..][..2]),
+                        )))
+                    } else {
+                        Err(Error)
+                    }
+                }
+                (1, 0b11) => {
+                    if let Some(id) = self.src_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::FullyElided,
+                        )))
+                    } else {
+                        Err(Error)
+                    }
+                }
                 _ => Err(Error),
             }
         }
@@ -676,55 +792,65 @@ pub mod iphc {
                 + self.hop_limit_size()
                 + self.src_address_size()) as usize;
 
+            let data = self.buffer.as_ref();
             match (self.m_field(), self.dac_field(), self.dam_field()) {
-                (0, 0, 0b00) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                        &data[start..][..16],
-                    )))
-                }
-                (0, 0, 0b01) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::InLine64bits(&data[start..][..8]),
-                    ))
-                }
-                (0, 0, 0b10) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::InLine16bits(&data[start..][..2]),
-                    ))
-                }
+                (0, 0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
+                    &data[start..][..16],
+                ))),
+                (0, 0, 0b01) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::InLine64bits(&data[start..][..8]),
+                )),
+                (0, 0, 0b10) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::InLine16bits(&data[start..][..2]),
+                )),
                 (0, 0, 0b11) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided)),
                 (0, 1, 0b00) => Ok(UnresolvedAddress::Reserved),
-                (0, 1, 0b01) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
-                (0, 1, 0b10) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
-                (0, 1, 0b11) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
-                (1, 0, 0b00) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                        &data[start..][..16],
-                    )))
+                (0, 1, 0b01) => {
+                    if let Some(id) = self.dst_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::InLine64bits(&data[start..][..8]),
+                        )))
+                    } else {
+                        Err(Error)
+                    }
                 }
-                (1, 0, 0b01) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::Multicast48bits(&data[start..][..6]),
-                    ))
+                (0, 1, 0b10) => {
+                    if let Some(id) = self.dst_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::InLine16bits(&data[start..][..2]),
+                        )))
+                    } else {
+                        Err(Error)
+                    }
                 }
-                (1, 0, 0b10) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::Multicast32bits(&data[start..][..4]),
-                    ))
+                (0, 1, 0b11) => {
+                    if let Some(id) = self.dst_context_id() {
+                        Ok(UnresolvedAddress::WithContext((
+                            id as usize,
+                            AddressMode::FullyElided,
+                        )))
+                    } else {
+                        Err(Error)
+                    }
                 }
-                (1, 0, 0b11) => {
-                    let data = self.buffer.as_ref();
-                    Ok(UnresolvedAddress::WithoutContext(
-                        AddressMode::Multicast8bits(&data[start..][..1]),
-                    ))
-                }
-                (1, 1, 0b00) => Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported)),
+                (1, 0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
+                    &data[start..][..16],
+                ))),
+                (1, 0, 0b01) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::Multicast48bits(&data[start..][..6]),
+                )),
+                (1, 0, 0b10) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::Multicast32bits(&data[start..][..4]),
+                )),
+                (1, 0, 0b11) => Ok(UnresolvedAddress::WithoutContext(
+                    AddressMode::Multicast8bits(&data[start..][..1]),
+                )),
+                (1, 1, 0b00) => Ok(UnresolvedAddress::WithContext((
+                    0,
+                    AddressMode::NotSupported,
+                ))),
                 (1, 1, 0b01 | 0b10 | 0b11) => Ok(UnresolvedAddress::Reserved),
                 _ => Err(Error),
             }
@@ -1063,7 +1189,6 @@ pub mod iphc {
 
     /// A high-level representation of a 6LoWPAN IPHC header.
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct Repr {
         pub src_addr: ipv6::Address,
         pub ll_src_addr: Option<LlAddress>,
@@ -1077,6 +1202,30 @@ pub mod iphc {
         pub flow_label: Option<u16>,
     }
 
+    impl core::fmt::Display for Repr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "IPHC src={} dst={} nxt-hdr={} hop-limit={}",
+                self.src_addr, self.dst_addr, self.next_header, self.hop_limit
+            )
+        }
+    }
+
+    #[cfg(feature = "defmt")]
+    impl defmt::Format for Repr {
+        fn format(&self, fmt: defmt::Formatter) {
+            defmt::write!(
+                fmt,
+                "IPHC src={} dst={} nxt-hdr={} hop-limit={}",
+                self.src_addr,
+                self.dst_addr,
+                self.next_header,
+                self.hop_limit
+            );
+        }
+    }
+
     impl Repr {
         /// Parse a 6LoWPAN IPHC header and return a high-level representation.
         ///
@@ -1086,6 +1235,7 @@ pub mod iphc {
             packet: &Packet<&T>,
             ll_src_addr: Option<LlAddress>,
             ll_dst_addr: Option<LlAddress>,
+            addr_context: &[AddressContext],
         ) -> Result<Self> {
             // Ensure basic accessors will work.
             packet.check_len()?;
@@ -1095,8 +1245,8 @@ pub mod iphc {
                 return Err(Error);
             }
 
-            let src_addr = packet.src_addr()?.resolve(ll_src_addr)?;
-            let dst_addr = packet.dst_addr()?.resolve(ll_dst_addr)?;
+            let src_addr = packet.src_addr()?.resolve(ll_src_addr, addr_context)?;
+            let dst_addr = packet.dst_addr()?.resolve(ll_dst_addr, addr_context)?;
 
             Ok(Self {
                 src_addr,
@@ -1116,10 +1266,9 @@ pub mod iphc {
             let mut len = 0;
             len += 2; // The minimal header length
 
-            len += if self.next_header == NextHeader::Compressed {
-                0 // The next header is compressed (we don't need to inline what the next header is)
-            } else {
-                1 // The next header field is inlined
+            len += match self.next_header {
+                NextHeader::Compressed => 0, // The next header is compressed (we don't need to inline what the next header is)
+                NextHeader::Uncompressed(_) => 1, // The next header field is inlined
             };
 
             // Hop Limit size
@@ -1293,11 +1442,17 @@ pub mod iphc {
 
             assert_eq!(
                 packet.src_addr(),
-                Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported))
+                Ok(UnresolvedAddress::WithContext((
+                    0,
+                    AddressMode::FullyElided
+                )))
             );
             assert_eq!(
                 packet.dst_addr(),
-                Ok(UnresolvedAddress::WithContext(AddressMode::NotSupported))
+                Ok(UnresolvedAddress::WithContext((
+                    0,
+                    AddressMode::FullyElided
+                )))
             );
         }
     }
@@ -1308,11 +1463,14 @@ pub mod nhc {
     //!
     //! [RFC 6282 § 4]: https://datatracker.ietf.org/doc/html/rfc6282#section-4
     use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER};
-    use crate::wire::{
-        ip::{checksum, Address as IpAddress},
-        ipv6,
-        udp::Repr as UdpRepr,
-        IpProtocol,
+    use crate::{
+        phy::ChecksumCapabilities,
+        wire::{
+            ip::{checksum, Address as IpAddress},
+            ipv6,
+            udp::Repr as UdpRepr,
+            IpProtocol,
+        },
     };
     use byteorder::{ByteOrder, NetworkEndian};
     use ipv6::Address;
@@ -1421,7 +1579,7 @@ pub mod nhc {
 
     impl<T: AsRef<[u8]>> ExtHeaderPacket<T> {
         /// Input a raw octet buffer with a 6LoWPAN NHC Extension Header structure.
-        pub fn new_unchecked(buffer: T) -> Self {
+        pub const fn new_unchecked(buffer: T) -> Self {
             ExtHeaderPacket { buffer }
         }
 
@@ -1499,10 +1657,10 @@ pub mod nhc {
         /// Return the size of the Next Header field.
         fn next_header_size(&self) -> usize {
             // If nh is set, then the Next Header is compressed using LOWPAN_NHC
-            if self.nh_field() == 1 {
-                0
-            } else {
-                1
+            match self.nh_field() {
+                0 => 1,
+                1 => 0,
+                _ => unreachable!(),
             }
         }
     }
@@ -1510,7 +1668,7 @@ pub mod nhc {
     impl<'a, T: AsRef<[u8]> + ?Sized> ExtHeaderPacket<&'a T> {
         /// Return a pointer to the payload.
         pub fn payload(&self) -> &'a [u8] {
-            let start = 1 + self.next_header_size();
+            let start = 2 + self.next_header_size();
             &self.buffer.as_ref()[start..]
         }
     }
@@ -1617,6 +1775,141 @@ pub mod nhc {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        use crate::wire::{Ipv6RoutingHeader, Ipv6RoutingRepr};
+
+        #[cfg(feature = "proto-rpl")]
+        use crate::wire::{
+            Ipv6Option, Ipv6OptionRepr, Ipv6OptionsIterator, RplHopByHopRepr, RplInstanceId,
+        };
+
+        #[cfg(feature = "proto-rpl")]
+        const RPL_HOP_BY_HOP_PACKET: [u8; 9] =
+            [0xe0, 0x3a, 0x06, 0x63, 0x04, 0x00, 0x1e, 0x03, 0x00];
+
+        const ROUTING_SR_PACKET: [u8; 32] = [
+            0xe3, 0x1e, 0x03, 0x03, 0x99, 0x30, 0x00, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00,
+            0x05, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+        ];
+
+        #[test]
+        #[cfg(feature = "proto-rpl")]
+        fn test_rpl_hop_by_hop_option_deconstruct() {
+            let header = ExtHeaderPacket::new_checked(&RPL_HOP_BY_HOP_PACKET).unwrap();
+            assert_eq!(
+                header.next_header(),
+                NextHeader::Uncompressed(IpProtocol::Icmpv6)
+            );
+            assert_eq!(header.extension_header_id(), ExtHeaderId::HopByHopHeader);
+
+            let options = header.payload();
+            let mut options = Ipv6OptionsIterator::new(options);
+            let rpl_repr = options.next().unwrap();
+            let rpl_repr = rpl_repr.unwrap();
+
+            match rpl_repr {
+                Ipv6OptionRepr::Rpl(rpl) => {
+                    assert_eq!(
+                        rpl,
+                        RplHopByHopRepr {
+                            down: false,
+                            rank_error: false,
+                            forwarding_error: false,
+                            instance_id: RplInstanceId::from(0x1e),
+                            sender_rank: 0x0300,
+                        }
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "proto-rpl")]
+        fn test_rpl_hop_by_hop_option_emit() {
+            let repr = Ipv6OptionRepr::Rpl(RplHopByHopRepr {
+                down: false,
+                rank_error: false,
+                forwarding_error: false,
+                instance_id: RplInstanceId::from(0x1e),
+                sender_rank: 0x0300,
+            });
+
+            let ext_hdr = ExtHeaderRepr {
+                ext_header_id: ExtHeaderId::HopByHopHeader,
+                next_header: NextHeader::Uncompressed(IpProtocol::Icmpv6),
+                length: repr.buffer_len() as u8,
+            };
+
+            let mut buffer = vec![0u8; ext_hdr.buffer_len() + repr.buffer_len()];
+            ext_hdr.emit(&mut ExtHeaderPacket::new_unchecked(
+                &mut buffer[..ext_hdr.buffer_len()],
+            ));
+            repr.emit(&mut Ipv6Option::new_unchecked(
+                &mut buffer[ext_hdr.buffer_len()..],
+            ));
+
+            assert_eq!(&buffer[..], RPL_HOP_BY_HOP_PACKET);
+        }
+
+        #[test]
+        fn test_source_routing_deconstruct() {
+            let header = ExtHeaderPacket::new_checked(&ROUTING_SR_PACKET).unwrap();
+            assert_eq!(header.next_header(), NextHeader::Compressed);
+            assert_eq!(header.extension_header_id(), ExtHeaderId::RoutingHeader);
+
+            let routing_hdr = Ipv6RoutingHeader::new_checked(header.payload()).unwrap();
+            let repr = Ipv6RoutingRepr::parse(&routing_hdr).unwrap();
+            assert_eq!(
+                repr,
+                Ipv6RoutingRepr::Rpl {
+                    segments_left: 3,
+                    cmpr_i: 9,
+                    cmpr_e: 9,
+                    pad: 3,
+                    addresses: &[
+                        0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05, 0x06, 0x00, 0x06, 0x00, 0x06,
+                        0x00, 0x06, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00
+                    ],
+                }
+            );
+        }
+
+        #[test]
+        fn test_source_routing_emit() {
+            let routing_hdr = Ipv6RoutingRepr::Rpl {
+                segments_left: 3,
+                cmpr_i: 9,
+                cmpr_e: 9,
+                pad: 3,
+                addresses: &[
+                    0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+                    0x06, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00,
+                ],
+            };
+
+            let ext_hdr = ExtHeaderRepr {
+                ext_header_id: ExtHeaderId::RoutingHeader,
+                next_header: NextHeader::Compressed,
+                length: routing_hdr.buffer_len() as u8,
+            };
+
+            let mut buffer = vec![0u8; ext_hdr.buffer_len() + routing_hdr.buffer_len()];
+            ext_hdr.emit(&mut ExtHeaderPacket::new_unchecked(
+                &mut buffer[..ext_hdr.buffer_len()],
+            ));
+            routing_hdr.emit(&mut Ipv6RoutingHeader::new_unchecked(
+                &mut buffer[ext_hdr.buffer_len()..],
+            ));
+
+            assert_eq!(&buffer[..], ROUTING_SR_PACKET);
+        }
+    }
+
     /// A read/write wrapper around a 6LoWPAN_NHC UDP frame.
     /// [RFC 6282 § 4.3] specifies the format of the header.
     ///
@@ -1640,7 +1933,7 @@ pub mod nhc {
 
     impl<T: AsRef<[u8]>> UdpNhcPacket<T> {
         /// Input a raw octet buffer with a LOWPAN_NHC frame structure for UDP.
-        pub fn new_unchecked(buffer: T) -> Self {
+        pub const fn new_unchecked(buffer: T) -> Self {
             Self { buffer }
         }
 
@@ -1681,7 +1974,7 @@ pub mod nhc {
         get_field!(ports_field, 0b11, 0);
 
         /// Returns the index of the start of the next header compressed fields.
-        fn nhc_fields_start(&self) -> usize {
+        const fn nhc_fields_start(&self) -> usize {
             1
         }
 
@@ -1863,6 +2156,7 @@ pub mod nhc {
             packet: &UdpNhcPacket<&'a T>,
             src_addr: &ipv6::Address,
             dst_addr: &ipv6::Address,
+            checksum_caps: &ChecksumCapabilities,
         ) -> Result<Self> {
             packet.check_len()?;
 
@@ -1870,28 +2164,27 @@ pub mod nhc {
                 return Err(Error);
             }
 
-            let payload_len = packet.payload().len();
-            let chk_sum = !checksum::combine(&[
-                checksum::pseudo_header(
-                    &IpAddress::Ipv6(*src_addr),
-                    &IpAddress::Ipv6(*dst_addr),
-                    crate::wire::ip::Protocol::Udp,
-                    payload_len as u32 + 8,
-                ),
-                packet.src_port(),
-                packet.dst_port(),
-                payload_len as u16 + 8,
-                checksum::data(packet.payload()),
-            ]);
+            if checksum_caps.udp.rx() {
+                let payload_len = packet.payload().len();
+                let chk_sum = !checksum::combine(&[
+                    checksum::pseudo_header(
+                        &IpAddress::Ipv6(*src_addr),
+                        &IpAddress::Ipv6(*dst_addr),
+                        crate::wire::ip::Protocol::Udp,
+                        payload_len as u32 + 8,
+                    ),
+                    packet.src_port(),
+                    packet.dst_port(),
+                    payload_len as u16 + 8,
+                    checksum::data(packet.payload()),
+                ]);
 
-            if let Some(checksum) = packet.checksum() {
-                if chk_sum != checksum {
-                    return Err(Error);
+                if let Some(checksum) = packet.checksum() {
+                    if chk_sum != checksum {
+                        return Err(Error);
+                    }
                 }
-            } else {
-                net_trace!("Currently we do not support elided checksums.");
-                return Err(Error);
-            };
+            }
 
             Ok(Self(UdpRepr {
                 src_port: packet.src_port(),
@@ -1970,7 +2263,7 @@ pub mod nhc {
             assert_eq!(packet.dispatch_field(), DISPATCH_EXT_HEADER);
             assert_eq!(packet.extension_header_id(), ExtHeaderId::RoutingHeader);
 
-            assert_eq!(packet.payload(), [0x06, 0x03, 0x00, 0xff, 0x00, 0x00, 0x00]);
+            assert_eq!(packet.payload(), [0x03, 0x00, 0xff, 0x00, 0x00, 0x00]);
         }
 
         #[test]
@@ -2067,14 +2360,16 @@ mod test {
 
     #[test]
     fn sixlowpan_three_fragments() {
-        use crate::iface::FragmentsCache;
-        use crate::time::Instant;
         use crate::wire::ieee802154::Frame as Ieee802154Frame;
         use crate::wire::ieee802154::Repr as Ieee802154Repr;
         use crate::wire::Ieee802154Address;
-        use std::collections::BTreeMap;
 
-        let mut frags_cache = FragmentsCache::new(vec![], BTreeMap::new());
+        let key = frag::Key {
+            ll_src_addr: Ieee802154Address::Extended([50, 147, 130, 47, 40, 8, 62, 217]),
+            ll_dst_addr: Ieee802154Address::Extended([26, 11, 66, 66, 66, 66, 66, 66]),
+            datagram_size: 307,
+            datagram_tag: 63,
+        };
 
         let frame1: &[u8] = &[
             0x41, 0xcc, 0x92, 0xef, 0xbe, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x0b, 0x1a, 0xd9,
@@ -2104,25 +2399,7 @@ mod test {
         assert_eq!(frag.datagram_tag(), 0x003f);
         assert_eq!(frag.datagram_offset(), 0);
 
-        let key = frag.get_key(&ieee802154_repr);
-
-        let uncompressed = 40 + 8;
-        let compressed = 5 + 7;
-
-        frags_cache
-            .reserve_with_key(&key)
-            .unwrap()
-            .start(
-                Some(frag.datagram_size() as usize - uncompressed + compressed),
-                Instant::now() + crate::time::Duration::from_secs(60),
-                -((uncompressed - compressed) as isize),
-            )
-            .unwrap();
-        frags_cache
-            .get_packet_assembler_mut(&key)
-            .unwrap()
-            .add(frag.payload(), 0)
-            .unwrap();
+        assert_eq!(frag.get_key(&ieee802154_repr), key);
 
         let frame2: &[u8] = &[
             0x41, 0xcc, 0x93, 0xef, 0xbe, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x0b, 0x1a, 0xd9,
@@ -2152,13 +2429,7 @@ mod test {
         assert_eq!(frag.datagram_tag(), 0x003f);
         assert_eq!(frag.datagram_offset(), 136 / 8);
 
-        let key = frag.get_key(&ieee802154_repr);
-
-        frags_cache
-            .get_packet_assembler_mut(&key)
-            .unwrap()
-            .add(frag.payload(), frag.datagram_offset() as usize * 8)
-            .unwrap();
+        assert_eq!(frag.get_key(&ieee802154_repr), key);
 
         let frame3: &[u8] = &[
             0x41, 0xcc, 0x94, 0xef, 0xbe, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x0b, 0x1a, 0xd9,
@@ -2187,59 +2458,6 @@ mod test {
         assert_eq!(frag.datagram_tag(), 0x003f);
         assert_eq!(frag.datagram_offset(), 232 / 8);
 
-        let key = frag.get_key(&ieee802154_repr);
-
-        frags_cache
-            .get_packet_assembler_mut(&key)
-            .unwrap()
-            .add(frag.payload(), frag.datagram_offset() as usize * 8)
-            .unwrap();
-
-        let assembled_packet = frags_cache.get_assembled_packet(&key).unwrap();
-
-        let sixlowpan_frame = SixlowpanPacket::dispatch(assembled_packet).unwrap();
-
-        let iphc = if let SixlowpanPacket::IphcHeader = sixlowpan_frame {
-            iphc::Packet::new_checked(assembled_packet).unwrap()
-        } else {
-            unreachable!()
-        };
-
-        let iphc_repr =
-            iphc::Repr::parse(&iphc, ieee802154_repr.src_addr, ieee802154_repr.dst_addr).unwrap();
-
-        assert_eq!(
-            iphc_repr.dst_addr,
-            ipv6::Address::from_bytes(&[
-                0xfe, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x18, 0xb, 0x42, 0x42, 0x42, 0x42, 0x42,
-                0x42,
-            ]),
-        );
-        assert_eq!(
-            iphc_repr.ll_dst_addr,
-            Some(Ieee802154Address::from_bytes(&[
-                0x1a, 0xb, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-            ])),
-        );
-        assert_eq!(iphc_repr.next_header, NextHeader::Compressed);
-        assert_eq!(iphc_repr.hop_limit, 64);
-
-        let sixlowpan_frame = nhc::NhcPacket::dispatch(iphc.payload()).unwrap();
-
-        let udp_hdr = if let nhc::NhcPacket::UdpHeader = sixlowpan_frame {
-            nhc::UdpNhcPacket::new_checked(iphc.payload()).unwrap()
-        } else {
-            unreachable!()
-        };
-
-        let payload = udp_hdr.payload();
-        assert_eq!(String::from_utf8_lossy(payload), "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Aliquam dui odio, iaculis vel rutrum at, tristique non nunc erat curae. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Aliquam dui odio, iaculis vel rutrum at, tristique non nunc erat curae. \n");
-
-        let udp_repr =
-            nhc::UdpNhcRepr::parse(&udp_hdr, &iphc_repr.src_addr, &iphc_repr.dst_addr).unwrap();
-
-        assert_eq!(udp_repr.src_port, 53855);
-        assert_eq!(udp_repr.dst_port, 6969);
-        assert_eq!(udp_hdr.checksum(), Some(0xb46b));
+        assert_eq!(frag.get_key(&ieee802154_repr), key);
     }
 }

@@ -165,7 +165,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 }
 
 /// A read/write wrapper around an MLDv2 Listener Report Message Address Record.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AddressRecord<T: AsRef<[u8]>> {
     buffer: T,
@@ -173,7 +173,7 @@ pub struct AddressRecord<T: AsRef<[u8]>> {
 
 impl<T: AsRef<[u8]>> AddressRecord<T> {
     /// Imbue a raw octet buffer with a Address Record structure.
-    pub fn new_unchecked(buffer: T) -> Self {
+    pub const fn new_unchecked(buffer: T) -> Self {
         Self { buffer }
     }
 
@@ -338,7 +338,7 @@ impl<'a> Repr<'a> {
     }
 
     /// Return the length of a packet that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         match self {
             Repr::Query { data, .. } => field::QUERY_NUM_SRCS.end + data.len(),
             Repr::Report { data, .. } => field::NR_MCAST_RCRDS.end + data.len(),
@@ -478,7 +478,7 @@ mod test {
             &Ipv6Address::LINK_LOCAL_ALL_NODES.into(),
             &Ipv6Address::LINK_LOCAL_ALL_ROUTERS.into(),
         );
-        assert_eq!(&packet.into_inner()[..], &QUERY_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &QUERY_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod test {
             &Ipv6Address::LINK_LOCAL_ALL_NODES.into(),
             &Ipv6Address::LINK_LOCAL_ALL_ROUTERS.into(),
         );
-        assert_eq!(&packet.into_inner()[..], &REPORT_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &REPORT_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &QUERY_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &QUERY_PACKET_BYTES[..]);
     }
 
     #[test]
@@ -573,6 +573,6 @@ mod test {
             &mut packet,
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &REPORT_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &REPORT_PACKET_BYTES[..]);
     }
 }

@@ -10,19 +10,14 @@ mod interface;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 mod neighbor;
 mod route;
+#[cfg(feature = "proto-rpl")]
+mod rpl;
 mod socket_meta;
 mod socket_set;
 
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-pub(crate) use self::neighbor::Answer as NeighborAnswer;
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-pub use self::neighbor::Cache as NeighborCache;
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-pub use self::neighbor::Neighbor;
-pub use self::route::{Route, Routes};
-pub use socket_set::{SocketHandle, SocketSet, SocketStorage};
+#[cfg(feature = "proto-igmp")]
+pub use self::interface::MulticastError;
+pub use self::interface::{Config, Interface, InterfaceInner as Context};
 
-#[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
-pub use self::fragmentation::{PacketAssembler, PacketAssemblerSet as FragmentsCache};
-
-pub use self::interface::{Interface, InterfaceBuilder, InterfaceInner as Context};
+pub use self::route::{Route, RouteTableFull, Routes};
+pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};

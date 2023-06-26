@@ -43,15 +43,13 @@
 
 mod utils;
 
-use log::debug;
-use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::str;
 
-use smoltcp::iface::{FragmentsCache, InterfaceBuilder, NeighborCache, SocketSet};
-use smoltcp::phy::{wait as phy_wait, Medium, RawSocket};
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::phy::{wait as phy_wait, Device, Medium, RawSocket};
 use smoltcp::socket::tcp;
-use smoltcp::wire::{Ieee802154Pan, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
 
 //For benchmark
 use smoltcp::time::{Duration, Instant};
@@ -65,9 +63,9 @@ use std::thread;
 use std::fs;
 
 fn if_nametoindex(ifname: &str) -> u32 {
-    let contents = fs::read_to_string(format!("/sys/devices/virtual/net/{}/ifindex", ifname))
+    let contents = fs::read_to_string(format!("/sys/devices/virtual/net/{ifname}/ifindex"))
         .expect("couldn't read interface from \"/sys/devices/virtual/net\"")
-        .replace("\n", "");
+        .replace('\n', "");
     contents.parse::<u32>().unwrap()
 }
 
@@ -111,7 +109,7 @@ fn client(kind: Client) {
                 // print!("(P:{})", result);
                 processed += result
             }
-            Err(err) => panic!("cannot process: {}", err),
+            Err(err) => panic!("cannot process: {err}"),
         }
     }
 
@@ -148,7 +146,28 @@ fn main() {
         _ => panic!("invalid mode"),
     };
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => Config::new(
+            Ieee802154Address::Extended([0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]).into(),
+        ),
+    };
+    config.random_seed = rand::random();
+    config.pan_id = Some(Ieee802154Pan(0xbeef));
+
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(
+                IpAddress::v6(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
+                64,
+            ))
+            .unwrap();
+    });
 
     let tcp1_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp1_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
@@ -157,26 +176,6 @@ fn main() {
     let tcp2_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp2_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp2_socket = tcp::Socket::new(tcp2_rx_buffer, tcp2_tx_buffer);
-
-    let ieee802154_addr = smoltcp::wire::Ieee802154Address::Extended([
-        0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    ]);
-    let ip_addrs = [IpCidr::new(
-        IpAddress::v6(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
-        64,
-    )];
-
-    let cache = FragmentsCache::new(vec![], BTreeMap::new());
-
-    let mut builder = InterfaceBuilder::new()
-        .ip_addrs(ip_addrs)
-        .pan_id(Ieee802154Pan(0xbeef));
-    builder = builder
-        .hardware_addr(ieee802154_addr.into())
-        .neighbor_cache(neighbor_cache)
-        .sixlowpan_fragments_cache(cache)
-        .sixlowpan_out_packet_cache(vec![]);
-    let mut iface = builder.finalize(&mut device);
 
     let mut sockets = SocketSet::new(vec![]);
     let tcp1_handle = sockets.add(tcp1_socket);
@@ -189,12 +188,7 @@ fn main() {
 
     while !CLIENT_DONE.load(Ordering::SeqCst) {
         let timestamp = Instant::now();
-        match iface.poll(timestamp, &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         // tcp:1234: emit data
         let socket = sockets.get_mut::<tcp::Socket>(tcp1_handle);

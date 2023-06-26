@@ -11,12 +11,18 @@ use crate::wire::{IpAddress, IpProtocol};
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.
 /// Sequence numbers do not have a discontiguity when compared pairwise across a signed overflow.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SeqNumber(pub i32);
 
 impl fmt::Display for SeqNumber {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0 as u32)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for SeqNumber {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.0 as u32);
     }
 }
 
@@ -67,7 +73,7 @@ impl cmp::PartialOrd for SeqNumber {
 }
 
 /// A read/write wrapper around a Transmission Control Protocol packet buffer.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
@@ -87,7 +93,7 @@ mod field {
     pub const CHECKSUM: Field = 16..18;
     pub const URGENT: Field = 18..20;
 
-    pub fn OPTIONS(length: u8) -> Field {
+    pub const fn OPTIONS(length: u8) -> Field {
         URGENT.end..(length as usize)
     }
 
@@ -113,7 +119,7 @@ pub const HEADER_LEN: usize = field::URGENT.end;
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with TCP packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -606,7 +612,7 @@ pub enum TcpOption<'a> {
 impl<'a> TcpOption<'a> {
     pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
         let (length, option);
-        match *buffer.get(0).ok_or(Error)? {
+        match *buffer.first().ok_or(Error)? {
             field::OPT_END => {
                 length = 1;
                 option = TcpOption::EndOfList;
@@ -753,7 +759,7 @@ pub enum Control {
 #[allow(clippy::len_without_is_empty)]
 impl Control {
     /// Return the length of a control flag, in terms of sequence space.
-    pub fn len(self) -> usize {
+    pub const fn len(self) -> usize {
         match self {
             Control::Syn | Control::Fin => 1,
             _ => 0,
@@ -761,7 +767,7 @@ impl Control {
     }
 
     /// Turn the PSH flag into no flag, and keep the rest as-is.
-    pub fn quash_psh(self) -> Control {
+    pub const fn quash_psh(self) -> Control {
         match self {
             Control::Psh => Control::None,
             _ => self,
@@ -771,7 +777,6 @@ impl Control {
 
 /// A high-level representation of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr<'a> {
     pub src_port: u16,
     pub dst_port: u16,
@@ -971,12 +976,12 @@ impl<'a> Repr<'a> {
     }
 
     /// Return the length of the segment, in terms of sequence space.
-    pub fn segment_len(&self) -> usize {
+    pub const fn segment_len(&self) -> usize {
         self.payload.len() + self.control.len()
     }
 
     /// Return whether the segment has no flags set (except PSH) and no data.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         match self.control {
             _ if !self.payload.is_empty() => false,
             Control::Syn | Control::Fin | Control::Rst => false,
@@ -1024,16 +1029,16 @@ impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
         while !options.is_empty() {
             let (next_options, option) = match TcpOption::parse(options) {
                 Ok(res) => res,
-                Err(err) => return write!(f, " ({})", err),
+                Err(err) => return write!(f, " ({err})"),
             };
             match option {
                 TcpOption::EndOfList => break,
                 TcpOption::NoOperation => (),
-                TcpOption::MaxSegmentSize(value) => write!(f, " mss={}", value)?,
-                TcpOption::WindowScale(value) => write!(f, " ws={}", value)?,
+                TcpOption::MaxSegmentSize(value) => write!(f, " mss={value}")?,
+                TcpOption::WindowScale(value) => write!(f, " ws={value}")?,
                 TcpOption::SackPermitted => write!(f, " sACK")?,
-                TcpOption::SackRange(slice) => write!(f, " sACKr{:?}", slice)?, // debug print conveniently includes the []s
-                TcpOption::Unknown { kind, .. } => write!(f, " opt({})", kind)?,
+                TcpOption::SackRange(slice) => write!(f, " sACKr{slice:?}")?, // debug print conveniently includes the []s
+                TcpOption::Unknown { kind, .. } => write!(f, " opt({kind})")?,
             }
             options = next_options;
         }
@@ -1053,14 +1058,37 @@ impl<'a> fmt::Display for Repr<'a> {
         }
         write!(f, " seq={}", self.seq_number)?;
         if let Some(ack_number) = self.ack_number {
-            write!(f, " ack={}", ack_number)?;
+            write!(f, " ack={ack_number}")?;
         }
         write!(f, " win={}", self.window_len)?;
         write!(f, " len={}", self.payload.len())?;
         if let Some(max_seg_size) = self.max_seg_size {
-            write!(f, " mss={}", max_seg_size)?;
+            write!(f, " mss={max_seg_size}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<'a> defmt::Format for Repr<'a> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "TCP src={} dst={}", self.src_port, self.dst_port);
+        match self.control {
+            Control::Syn => defmt::write!(fmt, " syn"),
+            Control::Fin => defmt::write!(fmt, " fin"),
+            Control::Rst => defmt::write!(fmt, " rst"),
+            Control::Psh => defmt::write!(fmt, " psh"),
+            Control::None => (),
+        }
+        defmt::write!(fmt, " seq={}", self.seq_number);
+        if let Some(ack_number) = self.ack_number {
+            defmt::write!(fmt, " ack={}", ack_number);
+        }
+        defmt::write!(fmt, " win={}", self.window_len);
+        defmt::write!(fmt, " len={}", self.payload.len());
+        if let Some(max_seg_size) = self.max_seg_size {
+            defmt::write!(fmt, " mss={}", max_seg_size);
+        }
     }
 }
 
@@ -1073,8 +1101,8 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         indent: &mut PrettyIndent,
     ) -> fmt::Result {
         match Packet::new_checked(buffer) {
-            Err(err) => write!(f, "{}({})", indent, err),
-            Ok(packet) => write!(f, "{}{}", indent, packet),
+            Err(err) => write!(f, "{indent}({err})"),
+            Ok(packet) => write!(f, "{indent}{packet}"),
         }
     }
 }
@@ -1148,7 +1176,7 @@ mod test {
         packet.options_mut().copy_from_slice(&OPTION_BYTES[..]);
         packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
         packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 
     #[test]
@@ -1215,7 +1243,7 @@ mod test {
             &DST_ADDR.into(),
             &ChecksumCapabilities::default(),
         );
-        assert_eq!(&packet.into_inner()[..], &SYN_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &SYN_PACKET_BYTES[..]);
     }
 
     #[test]

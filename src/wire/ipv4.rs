@@ -21,23 +21,30 @@ pub use super::IpProtocol as Protocol;
 // accept a packet of the following size.
 pub const MIN_MTU: usize = 576;
 
+/// Size of IPv4 adderess in octets.
+///
+/// [RFC 8200 § 2]: https://www.rfc-editor.org/rfc/rfc791#section-3.2
+pub const ADDR_SIZE: usize = 4;
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Key {
     id: u16,
     src_addr: Address,
     dst_addr: Address,
+    protocol: Protocol,
 }
 
 /// A four-octet IPv4 address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
-pub struct Address(pub [u8; 4]);
+pub struct Address(pub [u8; ADDR_SIZE]);
 
 impl Address {
     /// An unspecified address.
-    pub const UNSPECIFIED: Address = Address([0x00; 4]);
+    pub const UNSPECIFIED: Address = Address([0x00; ADDR_SIZE]);
 
     /// The broadcast address.
-    pub const BROADCAST: Address = Address([0xff; 4]);
+    pub const BROADCAST: Address = Address([0xff; ADDR_SIZE]);
 
     /// All multicast-capable nodes
     pub const MULTICAST_ALL_SYSTEMS: Address = Address([224, 0, 0, 1]);
@@ -55,13 +62,13 @@ impl Address {
     /// # Panics
     /// The function panics if `data` is not four octets long.
     pub fn from_bytes(data: &[u8]) -> Address {
-        let mut bytes = [0; 4];
+        let mut bytes = [0; ADDR_SIZE];
         bytes.copy_from_slice(data);
         Address(bytes)
     }
 
     /// Return an IPv4 address as a sequence of octets, in big-endian.
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
@@ -72,7 +79,7 @@ impl Address {
 
     /// Query whether the address is the broadcast address.
     pub fn is_broadcast(&self) -> bool {
-        self.0[0..4] == [255; 4]
+        self.0[0..4] == [255; ADDR_SIZE]
     }
 
     /// Query whether the address is a multicast address.
@@ -186,7 +193,7 @@ impl Cidr {
     }
 
     /// Return the network mask of this IPv4 CIDR.
-    pub fn netmask(&self) -> Address {
+    pub const fn netmask(&self) -> Address {
         if self.prefix_len == 0 {
             return Address([0, 0, 0, 0]);
         }
@@ -223,7 +230,7 @@ impl Cidr {
     }
 
     /// Return the network block of this IPv4 CIDR.
-    pub fn network(&self) -> Cidr {
+    pub const fn network(&self) -> Cidr {
         let mask = self.netmask().0;
         let network = [
             self.address.0[0] & mask[0],
@@ -267,12 +274,12 @@ impl fmt::Display for Cidr {
 #[cfg(feature = "defmt")]
 impl defmt::Format for Cidr {
     fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "{:?}/{=u8}", self.address, self.prefix_len);
+        defmt::write!(f, "{}/{=u8}", self.address, self.prefix_len);
     }
 }
 
 /// A read/write wrapper around an Internet Protocol version 4 packet buffer.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T,
@@ -297,7 +304,7 @@ pub const HEADER_LEN: usize = field::DST_ADDR.end;
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with IPv4 packet structure.
-    pub fn new_unchecked(buffer: T) -> Packet<T> {
+    pub const fn new_unchecked(buffer: T) -> Packet<T> {
         Packet { buffer }
     }
 
@@ -457,6 +464,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
             id: self.ident(),
             src_addr: self.src_addr(),
             dst_addr: self.dst_addr(),
+            protocol: self.next_header(),
         }
     }
 }
@@ -655,7 +663,7 @@ impl Repr {
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         // We never emit any options.
         field::DST_ADDR.end
     }
@@ -695,9 +703,9 @@ impl Repr {
 impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match Repr::parse(self, &ChecksumCapabilities::ignored()) {
-            Ok(repr) => write!(f, "{}", repr),
+            Ok(repr) => write!(f, "{repr}"),
             Err(err) => {
-                write!(f, "IPv4 ({})", err)?;
+                write!(f, "IPv4 ({err})")?;
                 write!(
                     f,
                     " src={} dst={} proto={} hop_limit={}",
@@ -760,7 +768,7 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         let checksum_caps = ChecksumCapabilities::ignored();
 
         let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{}({})", indent, err),
+            Err(err) => return write!(f, "{indent}({err})"),
             Ok(ip_packet) => match Repr::parse(&ip_packet, &checksum_caps) {
                 Err(_) => return Ok(()),
                 Ok(ip_repr) => {
@@ -774,7 +782,7 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
                         )?;
                         return Ok(());
                     } else {
-                        write!(f, "{}{}", indent, ip_repr)?;
+                        write!(f, "{indent}{ip_repr}")?;
                         format_checksum(f, ip_packet.verify_checksum())?;
                         (ip_repr, ip_packet.payload())
                     }
@@ -838,7 +846,7 @@ mod test {
         packet.set_dst_addr(Address([0x21, 0x22, 0x23, 0x24]));
         packet.fill_checksum();
         packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
-        assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
     }
 
     #[test]
@@ -871,9 +879,9 @@ mod test {
         0x14, 0x21, 0x22, 0x23, 0x24, 0xaa, 0x00, 0x00, 0xff,
     ];
 
-    static REPR_PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
+    static REPR_PAYLOAD_BYTES: [u8; ADDR_SIZE] = [0xaa, 0x00, 0x00, 0xff];
 
-    fn packet_repr() -> Repr {
+    const fn packet_repr() -> Repr {
         Repr {
             src_addr: Address([0x11, 0x12, 0x13, 0x14]),
             dst_addr: Address([0x21, 0x22, 0x23, 0x24]),
@@ -918,7 +926,7 @@ mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         repr.emit(&mut packet, &ChecksumCapabilities::default());
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
-        assert_eq!(&packet.into_inner()[..], &REPR_PACKET_BYTES[..]);
+        assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
     }
 
     #[test]

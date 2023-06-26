@@ -1,21 +1,14 @@
 mod utils;
 
 use log::debug;
-use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::str::{self, FromStr};
 
-#[cfg(any(
-    feature = "proto-sixlowpan-fragmentation",
-    feature = "proto-ipv4-fragmentation"
-))]
-use smoltcp::iface::FragmentsCache;
-
-use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{wait as phy_wait, Device, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 fn main() {
     utils::setup_logging("");
@@ -35,45 +28,41 @@ fn main() {
     let address = IpAddress::from_str(&matches.free[0]).expect("invalid address format");
     let port = u16::from_str(&matches.free[1]).expect("invalid port format");
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
+    config.random_seed = rand::random();
 
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100))
+        .unwrap();
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100))
+        .unwrap();
+
+    // Create sockets
     let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 1500]);
     let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 1500]);
     let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
-
-    let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
-    let ip_addrs = [IpCidr::new(IpAddress::v4(192, 168, 69, 2), 24)];
-    let default_v4_gw = Ipv4Address::new(192, 168, 69, 100);
-    let mut routes_storage = [None; 1];
-    let mut routes = Routes::new(&mut routes_storage[..]);
-    routes.add_default_ipv4_route(default_v4_gw).unwrap();
-
-    let medium = device.capabilities().medium;
-    let mut builder = InterfaceBuilder::new().ip_addrs(ip_addrs).routes(routes);
-
-    #[cfg(feature = "proto-ipv4-fragmentation")]
-    {
-        let ipv4_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder.ipv4_fragments_cache(ipv4_frag_cache);
-    }
-
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    let mut out_packet_buffer = [0u8; 1280];
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    {
-        let sixlowpan_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder
-            .sixlowpan_fragments_cache(sixlowpan_frag_cache)
-            .sixlowpan_out_packet_cache(&mut out_packet_buffer[..]);
-    }
-
-    if medium == Medium::Ethernet {
-        builder = builder
-            .hardware_addr(ethernet_addr.into())
-            .neighbor_cache(neighbor_cache);
-    }
-    let mut iface = builder.finalize(&mut device);
-
     let mut sockets = SocketSet::new(vec![]);
     let tcp_handle = sockets.add(tcp_socket);
 
@@ -85,12 +74,7 @@ fn main() {
     let mut tcp_active = false;
     loop {
         let timestamp = Instant::now();
-        match iface.poll(timestamp, &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
         if socket.is_active() && !tcp_active {

@@ -1,21 +1,14 @@
 mod utils;
 
 use log::debug;
-use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::os::unix::io::AsRawFd;
-use std::str;
 
-#[cfg(any(
-    feature = "proto-sixlowpan-fragmentation",
-    feature = "proto-ipv4-fragmentation"
-))]
-use smoltcp::iface::FragmentsCache;
-use smoltcp::iface::{InterfaceBuilder, NeighborCache, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{wait as phy_wait, Device, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 fn main() {
     utils::setup_logging("");
@@ -30,10 +23,47 @@ fn main() {
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
 
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
+    // Create interface
+    let mut config = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into())
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
 
-    let udp_rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 65535]);
-    let udp_tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 65535]);
+    config.random_seed = rand::random();
+
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64))
+            .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100))
+        .unwrap();
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100))
+        .unwrap();
+
+    // Create sockets
+    let udp_rx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+        vec![0; 65535],
+    );
+    let udp_tx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+        vec![0; 65535],
+    );
     let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
 
     let tcp1_rx_buffer = tcp::SocketBuffer::new(vec![0; 64]);
@@ -52,39 +82,6 @@ fn main() {
     let tcp4_tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
     let tcp4_socket = tcp::Socket::new(tcp4_rx_buffer, tcp4_tx_buffer);
 
-    let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    let ip_addrs = [
-        IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-        IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-        IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
-    ];
-
-    let medium = device.capabilities().medium;
-    let mut builder = InterfaceBuilder::new().ip_addrs(ip_addrs);
-
-    #[cfg(feature = "proto-ipv4-fragmentation")]
-    {
-        let ipv4_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder.ipv4_fragments_cache(ipv4_frag_cache);
-    }
-
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    let mut out_packet_buffer = [0u8; 1280];
-    #[cfg(feature = "proto-sixlowpan-fragmentation")]
-    {
-        let sixlowpan_frag_cache = FragmentsCache::new(vec![], BTreeMap::new());
-        builder = builder
-            .sixlowpan_fragments_cache(sixlowpan_frag_cache)
-            .sixlowpan_out_packet_cache(&mut out_packet_buffer[..]);
-    }
-
-    if medium == Medium::Ethernet {
-        builder = builder
-            .hardware_addr(ethernet_addr.into())
-            .neighbor_cache(neighbor_cache);
-    }
-    let mut iface = builder.finalize(&mut device);
-
     let mut sockets = SocketSet::new(vec![]);
     let udp_handle = sockets.add(udp_socket);
     let tcp1_handle = sockets.add(tcp1_socket);
@@ -95,12 +92,7 @@ fn main() {
     let mut tcp_6970_active = false;
     loop {
         let timestamp = Instant::now();
-        match iface.poll(timestamp, &mut device, &mut sockets) {
-            Ok(_) => {}
-            Err(e) => {
-                debug!("poll error: {}", e);
-            }
-        }
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         // udp:6969: respond "hello"
         let socket = sockets.get_mut::<udp::Socket>(udp_handle);
@@ -110,22 +102,16 @@ fn main() {
 
         let client = match socket.recv() {
             Ok((data, endpoint)) => {
-                debug!(
-                    "udp:6969 recv data: {:?} from {}",
-                    str::from_utf8(data).unwrap(),
-                    endpoint
-                );
-                Some(endpoint)
+                debug!("udp:6969 recv data: {:?} from {}", data, endpoint);
+                let mut data = data.to_vec();
+                data.reverse();
+                Some((endpoint, data))
             }
             Err(_) => None,
         };
-        if let Some(endpoint) = client {
-            let data = b"hello\n";
-            debug!(
-                "udp:6969 send data: {:?}",
-                str::from_utf8(data.as_ref()).unwrap()
-            );
-            socket.send_slice(data, endpoint).unwrap();
+        if let Some((endpoint, data)) = client {
+            debug!("udp:6969 send data: {:?} to {}", data, endpoint,);
+            socket.send_slice(&data, endpoint).unwrap();
         }
 
         // tcp:6969: respond "hello"
@@ -160,10 +146,7 @@ fn main() {
                     let recvd_len = buffer.len();
                     let mut data = buffer.to_owned();
                     if !data.is_empty() {
-                        debug!(
-                            "tcp:6970 recv data: {:?}",
-                            str::from_utf8(data.as_ref()).unwrap_or("(invalid utf8)")
-                        );
+                        debug!("tcp:6970 recv data: {:?}", data);
                         data = data.split(|&b| b == b'\n').collect::<Vec<_>>().concat();
                         data.reverse();
                         data.extend(b"\n");
@@ -172,10 +155,7 @@ fn main() {
                 })
                 .unwrap();
             if socket.can_send() && !data.is_empty() {
-                debug!(
-                    "tcp:6970 send data: {:?}",
-                    str::from_utf8(data.as_ref()).unwrap_or("(invalid utf8)")
-                );
+                debug!("tcp:6970 send data: {:?}", data);
                 socket.send_slice(&data[..]).unwrap();
             }
         } else if socket.may_send() {

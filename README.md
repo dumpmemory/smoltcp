@@ -4,6 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/crates/d/smoltcp.svg)](https://crates.io/crates/smoltcp)
 [![crates.io](https://img.shields.io/matrix/smoltcp:matrix.org)](https://matrix.to/#/#smoltcp:matrix.org)
+[![codecov](https://codecov.io/github/smoltcp-rs/smoltcp/branch/master/graph/badge.svg?token=3KbAR9xH1t)](https://codecov.io/github/smoltcp-rs/smoltcp)
 
 _smoltcp_ is a standalone, event-driven TCP/IP stack that is designed for bare-metal,
 real-time systems. Its design goals are simplicity and robustness. Its design anti-goals
@@ -11,7 +12,7 @@ include complicated compile-time computations, such as macro or type tricks, eve
 at cost of performance degradation.
 
 _smoltcp_ does not need heap allocation *at all*, is [extensively documented][docs],
-and compiles on stable Rust 1.56 and later.
+and compiles on stable Rust 1.65 and later.
 
 _smoltcp_ achieves [~Gbps of throughput](#examplesbenchmarkrs) when tested against
 the Linux TCP stack in loopback mode.
@@ -49,7 +50,7 @@ There are 3 supported mediums.
   * IPv4 time-to-live value is configurable per socket, set to 64 by default.
   * IPv4 default gateway is supported.
   * Routing outgoing IPv4 packets is supported, through a default gateway or a CIDR route table.
-  * IPv4 fragmentation is **not** supported.
+  * IPv4 fragmentation and reassembly is supported.
   * IPv4 options are **not** supported and are silently ignored.
 
 #### IPv6
@@ -86,7 +87,7 @@ The ICMPv4 protocol is supported, and ICMP sockets are available.
 
 #### ICMPv6
 
-The ICMPv6 protocol is supported, but is **not** available via ICMP sockets.
+The ICMPv6 protocol is supported, and ICMP sockets are available.
 
   * ICMPv6 header checksum is supported.
   * ICMPv6 echo replies are generated in response to echo requests.
@@ -147,6 +148,8 @@ You probably want to disable default features and configure them one by one:
 smoltcp = { version = "0.8.0", default-features = false, features = ["log"] }
 ```
 
+## Feature flags
+
 ### Feature `std`
 
 The `std` feature enables use of objects and slices owned by the networking stack through a
@@ -195,7 +198,7 @@ Enable `smoltcp::phy::RawSocket` and `smoltcp::phy::TunTapInterface`, respective
 
 These features are enabled by default.
 
-### Features `socket-raw`, `socket-udp`, `socket-tcp`, `socket-icmp`, `socket-dhcpv4`
+### Features `socket-raw`, `socket-udp`, `socket-tcp`, `socket-icmp`, `socket-dhcpv4`, `socket-dns`
 
 Enable the corresponding socket type.
 
@@ -207,6 +210,73 @@ Enable [IPv4] and [IPv6] respectively.
 
 [IPv4]: https://tools.ietf.org/rfc/rfc791.txt
 [IPv6]: https://tools.ietf.org/rfc/rfc8200.txt
+
+## Configuration
+
+_smoltcp_ has some configuration settings that are set at compile time, affecting sizes
+and counts of buffers.
+
+They can be set in two ways:
+
+- Via Cargo features: enable a feature like `<name>-<value>`. `name` must be in lowercase and
+use dashes instead of underscores. For example. `iface-max-addr-count-3`. Only a selection of values
+is available, check `Cargo.toml` for the list.
+- Via environment variables at build time: set the variable named `SMOLTCP_<value>`. For example 
+`SMOLTCP_IFACE_MAX_ADDR_COUNT=3 cargo build`. You can also set them in the `[env]` section of `.cargo/config.toml`. 
+Any value can be set, unlike with Cargo features.
+
+Environment variables take precedence over Cargo features. If two Cargo features are enabled for the same setting
+with different values, compilation fails.
+
+### `IFACE_MAX_ADDR_COUNT`
+
+Max amount of IP addresses that can be assigned to one interface (counting both IPv4 and IPv6 addresses). Default: 2.
+
+### `IFACE_MAX_MULTICAST_GROUP_COUNT`
+
+Max amount of multicast groups that can be joined by one interface. Default: 4.
+
+### `IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT`
+
+Max amount of 6LoWPAN address contexts that can be assigned to one interface. Default: 4.
+
+### `IFACE_NEIGHBOR_CACHE_COUNT`
+
+Amount of "IP address -> hardware address" entries the neighbor cache (also known as the "ARP cache" or the "ARP table") holds. Default: 4.
+
+### `IFACE_MAX_ROUTE_COUNT`
+
+Max amount of routes that can be added to one interface. Includes the default route. Includes both IPv4 and IPv6. Default: 2.
+
+### `FRAGMENTATION_BUFFER_SIZE`
+
+Size of the buffer used for fragmenting outgoing packets larger than the MTU. Packets larger than this setting will be dropped instead of fragmented. Default: 1500.
+
+### `ASSEMBLER_MAX_SEGMENT_COUNT`
+
+Maximum number of non-contiguous segments the assembler can hold. Used for both packet reassembly and TCP stream reassembly. Default: 4.
+
+### `REASSEMBLY_BUFFER_SIZE`
+
+Size of the buffer used for reassembling (de-fragmenting) incoming packets. If the reassembled packet is larger than this setting, it will be dropped instead of reassembled. Default: 1500.
+
+### `REASSEMBLY_BUFFER_COUNT`
+
+Number of reassembly buffers, i.e how many different incoming packets can be reassembled at the same time. Default: 1.
+
+### `DNS_MAX_RESULT_COUNT`
+
+Maximum amount of address results for a given DNS query that will be kept. For example, if this is set to 2 and the queried name has 4 `A` records, only the first 2 will be returned. Default: 1.
+
+### `DNS_MAX_SERVER_COUNT`
+
+Maximum amount of DNS servers that can be configured in one DNS socket. Default: 1.
+
+### `DNS_MAX_NAME_SIZE`
+
+Maximum length of DNS names that can be queried. Default: 255.
+
+
 
 ## Hosted usage examples
 
@@ -391,7 +461,7 @@ It responds to:
 
   * pings (`ping 192.168.69.1`);
   * UDP packets on port 6969 (`socat stdio udp4-connect:192.168.69.1:6969 <<<"abcdefg"`),
-    where it will respond "hello" to any incoming packet;
+    where it will respond with reversed chunks of the input indefinitely;
   * TCP connections on port 6969 (`socat stdio tcp4-connect:192.168.69.1:6969`),
     where it will respond "hello" to any incoming connection and immediately close it;
   * TCP connections on port 6970 (`socat stdio tcp4-connect:192.168.69.1:6970 <<<"abcdefg"`),
